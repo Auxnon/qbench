@@ -35,7 +35,8 @@ the Charm-flavoured widgets from [ratatui-cheese](https://github.com/shashanktom
   <kbd>Ctrl+S</kbd> checks every draft's key against the table and always asks for confirmation,
   warning by name about any draft that would **overwrite** an existing row. All drafts are then written
   in one transaction, so any error rolls back the whole batch and keeps the drafts. <kbd>dd</kbd>
-  discards a draft. You can't page, reload, switch tables or quit without confirming while drafts exist.
+  discards a draft and <kbd>Ctrl+E</kbd> discards all of them. You can't page, reload or switch tables
+  while drafts exist, and <kbd>q</kbd> asks before quitting.
 - **Delete rows.** <kbd>dd</kbd> on a saved row, or <kbd>v</kbd> to select rows in visual mode then
   <kbd>d</kbd>, opens a confirmation listing how many rows will go and their keys. Deletes run in one
   transaction. Each must match exactly one row (by primary key, or ctid), otherwise nothing is deleted.
@@ -91,7 +92,7 @@ cargo run -- postgres://postgres:qbench@localhost:55432/postgres
 | Anywhere | `tab` switch pane · `?` full help · `q` / `ctrl+c` quit · `r` refresh |
 | Tables | `↑↓`/`jk` move · `enter` open · `/` fuzzy filter · `esc` clear filter |
 | Grid motion | `←↑↓→`/`hjkl` · `w`/`e` next column · `b` previous column · `gg`/`G` first/last row · `^`/`$` first/last column · `H`/`M`/`L` top/middle/bottom of screen · `ctrl+d/u` half page · `ctrl+f/b`, `pgup`/`pgdn` full page · `[`/`]` previous/next page |
-| Grid editing | `enter`/`a` edit · `i` edit, cursor at start · `s`/`cc` replace value · `Y`/`yy` yank · `p` paste · `o`/`O` clone row · `dd` delete row (confirms) or discard draft · `ctrl+s` commit drafts |
+| Grid editing | `enter`/`a` edit · `i` edit, cursor at start · `s`/`cc` replace value · `Y`/`yy` yank · `p` paste · `o`/`O` clone row · `dd` delete row (confirms) or discard draft · `ctrl+s` commit drafts · `ctrl+e` discard all drafts |
 | Visual | `v`/`V` start · any motion extends · `d`/`x` delete selected rows (confirms) · `y` yank rows as TSV · `esc`/`v` exit |
 | Panes | `esc`/`ctrl+h` table list · `ctrl+l` grid · `/` filter tables |
 | Dropdown | type to fuzzy find · `↑↓`, `tab`, `ctrl+j/k` select · `enter` or click apply · `esc` cancel |

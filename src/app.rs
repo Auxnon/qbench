@@ -492,6 +492,9 @@ impl App {
         if ctrl && key.code == KeyCode::Char('s') {
             return self.commit_drafts();
         }
+        if ctrl && key.code == KeyCode::Char('e') {
+            return self.discard_all_drafts();
+        }
         if self.focus == Focus::Tables && self.filter_active {
             return self.on_filter_key(key);
         }
@@ -842,6 +845,22 @@ impl App {
         self.set_status(
             StatusKind::Success,
             format!("yanked {n} row{} as TSV · {via}", if n == 1 { "" } else { "s" }),
+        );
+    }
+
+    /// Drops every staged draft row (ctrl+e).
+    fn discard_all_drafts(&mut self) {
+        let Some(d) = &mut self.data else { return };
+        let n = d.draft_count();
+        if n == 0 {
+            return self.set_status(StatusKind::Info, "no draft rows to discard");
+        }
+        d.rows.retain(|r| !r.is_draft());
+        self.visual_anchor = None;
+        self.clamp_cursor();
+        self.set_status(
+            StatusKind::Info,
+            format!("discarded {n} draft row{}", if n == 1 { "" } else { "s" }),
         );
     }
 

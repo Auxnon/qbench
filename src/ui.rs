@@ -794,6 +794,7 @@ fn help(app: &App, p: &Palette) -> Help {
             Binding::new("v", "visual row select"),
             Binding::new("shift+click", "extend selection"),
             Binding::new("ctrl+s", "commit drafts"),
+            Binding::new("ctrl+e", "discard all drafts"),
             Binding::new("tab", "switch pane"),
             Binding::new("ctrl+h/l", "tables/grid"),
             Binding::new("/", "filter tables"),
@@ -1107,7 +1108,7 @@ fn draw_confirm(buf: &mut Buffer, screen: Rect, app: &mut App, p: &Palette) {
             vec![
                 Line::styled(format!("{drafts} uncommitted draft row(s) will be lost."), warn),
                 Line::raw(""),
-                Line::styled("ctrl+s commits them instead.", Style::new().fg(p.muted)),
+                Line::styled("ctrl+s commits them · ctrl+e discards them", Style::new().fg(p.muted)),
             ],
         ),
         Confirm::Insert {
