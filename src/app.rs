@@ -9,7 +9,9 @@ use ratatui_cheese::spinner::{SpinnerState, SpinnerType};
 use ratatui_cheese::theme::Palette;
 
 use crate::clipboard;
-use crate::db::{CellUpdate, CellValue, ColKind, DataRow, Db, InsertBatch, Response, TableData, TableInfo, TableRef};
+use crate::db::{
+    self, CellUpdate, CellValue, ColKind, DataRow, Db, InsertBatch, Response, TableData, TableInfo, TableRef,
+};
 use crate::favorites::{self, Favorites};
 use crate::fuzzy;
 
@@ -108,6 +110,15 @@ pub enum Confirm {
     Quit {
         drafts: usize,
     },
+    /// Delete saved rows; drafts in the same selection (`lo..=hi`) are discarded with them.
+    Delete {
+        table: TableRef,
+        rows: Vec<DataRow>,
+        keys: Vec<String>,
+        lo: usize,
+        hi: usize,
+        drafts: usize,
+    },
 }
 
 pub enum Popup {
@@ -147,6 +158,8 @@ pub struct App {
 
     /// First key of a two-key vim sequence (`gg`, `yy`, `cc`).
     pub pending_key: Option<char>,
+    /// Row where visual (`v`) selection started; the selection runs to `cur_row`.
+    pub visual_anchor: Option<usize>,
     /// Last yanked cell.
     register: Option<CellValue>,
 
@@ -187,6 +200,7 @@ impl App {
             cell_anchor: None,
             hits: Hits::default(),
             pending_key: None,
+            visual_anchor: None,
             register: None,
             focus: Focus::Tables,
             popup: Popup::None,
@@ -257,6 +271,7 @@ impl App {
                     }
                 }
                 self.data = Some(data);
+                self.visual_anchor = None;
                 self.clamp_cursor();
             }
             Response::RowUpdated {
@@ -291,6 +306,24 @@ impl App {
                     rows,
                     collisions,
                 });
+            }
+            Response::Deleted { table, ctids } => {
+                let n = ctids.len();
+                self.set_status(
+                    StatusKind::Success,
+                    format!(
+                        "deleted {n} row{} from {}",
+                        if n == 1 { "" } else { "s" },
+                        table.short()
+                    ),
+                );
+                if let Some(d) = &mut self.data
+                    && d.info.table == table
+                {
+                    d.rows.retain(|r| r.ctid.as_ref().is_none_or(|c| !ctids.contains(c)));
+                    d.total -= n as i64;
+                    self.clamp_cursor();
+                }
             }
             Response::Inserted {
                 table,
@@ -586,12 +619,23 @@ impl App {
         // Last row currently on screen, for H / M / L.
         let bottom = (self.row_scroll + screen - 1).min(last_row);
         let (row, col) = (self.cur_row, self.cur_col);
+        if self.visual_anchor.is_some() && !ctrl {
+            match key.code {
+                KeyCode::Char('d' | 'x' | 'D' | 'X') | KeyCode::Delete => return self.delete_selection(),
+                KeyCode::Char('y' | 'Y') => return self.yank_rows(),
+                KeyCode::Esc | KeyCode::Char('v' | 'V') => {
+                    self.visual_anchor = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
         match (pending, key.code) {
             // Two-key sequences.
             (Some('g'), KeyCode::Char('g')) => self.cur_row = 0,
             (Some('y'), KeyCode::Char('y')) => self.yank_cell(),
             (Some('c'), KeyCode::Char('c' | 'w' | 'W' | 'e' | 'E' | 'l' | '$')) => self.open_editor(EditStart::Replace),
-            (Some('d'), KeyCode::Char('d')) => self.discard_draft(),
+            (Some('d'), KeyCode::Char('d')) => self.delete_rows(row, row),
             (_, KeyCode::Char(c @ ('g' | 'y' | 'c' | 'd'))) if !ctrl => self.pending_key = Some(c),
 
             // Ctrl chords: scrolling and pane switching.
@@ -630,6 +674,13 @@ impl App {
             (_, KeyCode::Char('s' | 'S')) => self.open_editor(EditStart::Replace),
             (_, KeyCode::Char('Y')) => self.yank_cell(),
             (_, KeyCode::Char('p' | 'P')) => self.paste_cell(),
+            (_, KeyCode::Char('v' | 'V')) => {
+                self.visual_anchor = Some(row);
+                self.set_status(
+                    StatusKind::Info,
+                    "visual: move to extend · d delete · y yank rows · esc exit",
+                );
+            }
             (_, KeyCode::Char('o')) => self.clone_row(false),
             (_, KeyCode::Char('O')) => self.clone_row(true),
 
@@ -723,18 +774,75 @@ impl App {
         );
     }
 
-    fn discard_draft(&mut self) {
-        let Some(d) = &mut self.data else { return };
-        if !d.rows.get(self.cur_row).is_some_and(DataRow::is_draft) {
-            return self.set_status(
-                StatusKind::Info,
-                "dd only discards draft rows; deleting saved rows isn't supported",
-            );
+    /// Inclusive row range of the visual selection.
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        self.visual_anchor.map(|a| (a.min(self.cur_row), a.max(self.cur_row)))
+    }
+
+    fn delete_selection(&mut self) {
+        if let Some((lo, hi)) = self.selection() {
+            self.visual_anchor = None;
+            self.delete_rows(lo, hi);
         }
-        d.rows.remove(self.cur_row);
-        let left = d.draft_count();
-        self.clamp_cursor();
-        self.set_status(StatusKind::Info, format!("draft discarded · {left} left"));
+    }
+
+    /// Deletes rows `lo..=hi`. Drafts alone are discarded on the spot; saved rows go
+    /// through a confirmation first.
+    fn delete_rows(&mut self, lo: usize, hi: usize) {
+        let Some(d) = &mut self.data else { return };
+        if d.rows.is_empty() {
+            return;
+        }
+        let hi = hi.min(d.rows.len() - 1);
+        let live: Vec<DataRow> = d.rows[lo..=hi].iter().filter(|r| !r.is_draft()).cloned().collect();
+        let drafts = hi + 1 - lo - live.len();
+        if live.is_empty() {
+            let mut i = hi + 1;
+            while i > lo {
+                i -= 1;
+                d.rows.remove(i);
+            }
+            let left = d.draft_count();
+            self.cur_row = lo;
+            self.clamp_cursor();
+            return self.set_status(StatusKind::Info, format!("discarded {drafts} draft(s) · {left} left"));
+        }
+        if !d.info.kind.editable() {
+            let kind = d.info.kind.label();
+            return self.set_status(StatusKind::Error, format!("can't delete from {kind}s"));
+        }
+        let keys = live.iter().map(|r| db::key_label(&d.columns, r)).collect();
+        self.popup = Popup::Confirm(Confirm::Delete {
+            table: d.info.table.clone(),
+            rows: live,
+            keys,
+            lo,
+            hi,
+            drafts,
+        });
+    }
+
+    /// Yanks the selected rows as tab-separated lines (NULL becomes an empty field).
+    fn yank_rows(&mut self) {
+        let Some((lo, hi)) = self.selection() else { return };
+        self.visual_anchor = None;
+        let Some(d) = &self.data else { return };
+        let text: Vec<String> = d.rows[lo..=hi.min(d.rows.len().saturating_sub(1))]
+            .iter()
+            .map(|r| {
+                r.values
+                    .iter()
+                    .map(|v| v.as_deref().unwrap_or("").replace(['\t', '\n'], " "))
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect();
+        let n = text.len();
+        let via = clipboard::copy(&text.join("\n"));
+        self.set_status(
+            StatusKind::Success,
+            format!("yanked {n} row{} as TSV · {via}", if n == 1 { "" } else { "s" }),
+        );
     }
 
     /// Checks drafts against existing keys; the reply opens the confirmation.
@@ -762,6 +870,30 @@ impl App {
         }
         match confirm {
             Confirm::Quit { .. } => self.quit = true,
+            Confirm::Delete {
+                table,
+                rows,
+                lo,
+                hi,
+                drafts,
+                ..
+            } => {
+                let Some(d) = self.data.as_mut().filter(|d| d.info.table == table) else {
+                    return;
+                };
+                if drafts > 0 {
+                    let mut i = hi.min(d.rows.len().saturating_sub(1)) + 1;
+                    while i > lo {
+                        i -= 1;
+                        if d.rows[i].is_draft() {
+                            d.rows.remove(i);
+                        }
+                    }
+                }
+                let (info, columns) = (d.info.clone(), d.columns.clone());
+                self.pending += 1;
+                self.db.delete_rows(info, columns, rows);
+            }
             Confirm::Insert {
                 table,
                 rows,
@@ -976,15 +1108,20 @@ impl App {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.pending_key = None;
-                self.on_click(pos);
+                self.on_click(pos, m.modifiers.contains(KeyModifiers::SHIFT));
             }
+            // Shift+wheel is the usual horizontal scroll on mice without a tilt wheel.
+            MouseEventKind::ScrollDown if m.modifiers.contains(KeyModifiers::SHIFT) => self.on_hscroll(pos, 1),
+            MouseEventKind::ScrollUp if m.modifiers.contains(KeyModifiers::SHIFT) => self.on_hscroll(pos, -1),
+            MouseEventKind::ScrollRight => self.on_hscroll(pos, 1),
+            MouseEventKind::ScrollLeft => self.on_hscroll(pos, -1),
             MouseEventKind::ScrollDown => self.on_scroll(pos, 3),
             MouseEventKind::ScrollUp => self.on_scroll(pos, -3),
             _ => {}
         }
     }
 
-    fn on_click(&mut self, pos: Position) {
+    fn on_click(&mut self, pos: Position, shift: bool) {
         if !matches!(self.popup, Popup::None) {
             let option = hit(&self.hits.options, pos);
             let inside = self.hits.popup.is_some_and(|r| r.contains(pos));
@@ -1016,6 +1153,13 @@ impl App {
                 .collect::<Vec<_>>(),
             pos,
         ) {
+            // Shift+click extends a visual row selection from the cursor.
+            if shift && self.focus == Focus::Grid {
+                self.visual_anchor.get_or_insert(self.cur_row);
+                self.cur_row = row;
+                self.cur_col = col;
+                return;
+            }
             // A click on the already-selected cell edits it.
             let again = self.focus == Focus::Grid && (row, col) == (self.cur_row, self.cur_col);
             self.focus = Focus::Grid;
@@ -1030,6 +1174,18 @@ impl App {
             self.focus = Focus::Tables;
         } else if self.hits.grid.contains(pos) {
             self.focus_grid();
+        }
+    }
+
+    fn on_hscroll(&mut self, pos: Position, delta: isize) {
+        if matches!(self.popup, Popup::None)
+            && self.hits.grid.contains(pos)
+            && let Some(d) = &self.data
+        {
+            self.cur_col = self
+                .cur_col
+                .saturating_add_signed(delta)
+                .min(d.columns.len().saturating_sub(1));
         }
     }
 

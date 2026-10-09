@@ -391,6 +391,7 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
         .collect();
 
     let gutter = (first + d.rows.len()).max(1).to_string().len() as u16 + 1;
+    let selection = app.selection();
     // Saved-row numbering skips drafts.
     let mut row_numbers = Vec::with_capacity(d.rows.len());
     let mut n = first;
@@ -466,6 +467,18 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
     for (ri, row) in d.rows.iter().enumerate().skip(app.row_scroll).take(rows_h) {
         let y = inner.y + 3 + (ri - app.row_scroll) as u16;
         let row_selected = ri == app.cur_row;
+        let in_visual = selection.is_some_and(|(lo, hi)| (lo..=hi).contains(&ri));
+        if in_visual {
+            buf.set_style(
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+                Style::new().bg(p.surface).add_modifier(Modifier::BOLD),
+            );
+        }
         if row_selected {
             buf.set_style(
                 Rect {
@@ -477,7 +490,7 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
                 Style::new().bg(p.surface),
             );
         }
-        let (num, num_style) = if row.is_draft() {
+        let (num, mut num_style) = if row.is_draft() {
             (
                 format!("{:>width$}", "+", width = gutter as usize - 1),
                 Style::new().fg(p.success).add_modifier(Modifier::BOLD),
@@ -490,6 +503,12 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
             };
             (format!("{:>width$}", row_numbers[ri], width = gutter as usize - 1), st)
         };
+        if in_visual {
+            num_style = Style::new()
+                .fg(p.on_highlight)
+                .bg(p.secondary)
+                .add_modifier(Modifier::BOLD);
+        }
         buf.set_string(inner.x, y, num, num_style);
 
         for &(ci, x, w) in &cols {
@@ -605,6 +624,17 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, p: &Palette) {
 
     let Some(d) = &app.data else { return };
     let mut badges: Vec<Span> = Vec::new();
+    if let Some((lo, hi)) = app.selection() {
+        let n = hi + 1 - lo;
+        badges.push(Span::styled(
+            format!(" VISUAL {n} row{} ", if n == 1 { "" } else { "s" }),
+            Style::new()
+                .fg(p.on_highlight)
+                .bg(p.primary)
+                .add_modifier(Modifier::BOLD),
+        ));
+        badges.push(Span::raw("  "));
+    }
     if let Some(k) = app.pending_key {
         badges.push(Span::styled(
             format!(" {k}… "),
@@ -719,11 +749,19 @@ fn help(app: &App, p: &Palette) -> Help {
             Binding::new("?", "more"),
             Binding::new("q", "quit"),
         ],
+        (Popup::None, Focus::Grid) if app.visual_anchor.is_some() => vec![
+            Binding::new("j/k/G/gg", "extend"),
+            Binding::new("d", "delete rows"),
+            Binding::new("y", "yank rows"),
+            Binding::new("esc", "exit visual"),
+        ],
         (Popup::None, Focus::Grid) => vec![
             Binding::new("hjkl/wb", "move"),
             Binding::new("enter/i", "edit"),
             Binding::new("Y/p", "yank/paste"),
             Binding::new("o", "clone row"),
+            Binding::new("v", "visual"),
+            Binding::new("dd", "delete"),
             Binding::new("ctrl+s", "commit"),
             Binding::new("[/]", "page"),
             Binding::new("esc", "tables"),
@@ -752,7 +790,9 @@ fn help(app: &App, p: &Palette) -> Help {
         ],
         vec![
             Binding::new("o/O", "clone row below/above"),
-            Binding::new("dd", "discard draft"),
+            Binding::new("dd", "delete row / draft"),
+            Binding::new("v", "visual row select"),
+            Binding::new("shift+click", "extend selection"),
             Binding::new("ctrl+s", "commit drafts"),
             Binding::new("tab", "switch pane"),
             Binding::new("ctrl+h/l", "tables/grid"),
@@ -1029,6 +1069,39 @@ fn draw_confirm(buf: &mut Buffer, screen: Rect, app: &mut App, p: &Palette) {
     let Popup::Confirm(confirm) = &app.popup else { return };
     let warn = Style::new().fg(p.error).add_modifier(Modifier::BOLD);
     let (title, mut lines) = match confirm {
+        Confirm::Delete {
+            table, keys, drafts, ..
+        } => {
+            let n = keys.len();
+            let mut lines = vec![Line::from(vec![
+                Span::styled(format!("Delete {n} row{}", if n == 1 { "" } else { "s" }), warn),
+                Span::styled(" from ", Style::new().fg(p.muted)),
+                Span::styled(table.full(), Style::new().fg(p.secondary).add_modifier(Modifier::BOLD)),
+            ])];
+            lines.push(Line::raw(""));
+            for key in keys.iter().take(8) {
+                lines.push(Line::styled(format!("    {key}"), Style::new().fg(p.error)));
+            }
+            if n > 8 {
+                lines.push(Line::styled(
+                    format!("    … and {} more", n - 8),
+                    Style::new().fg(p.error),
+                ));
+            }
+            if *drafts > 0 {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("+ {drafts} draft row(s) in the selection will be discarded"),
+                    Style::new().fg(p.primary),
+                ));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "This can't be undone. All rows are deleted in one transaction.",
+                Style::new().fg(p.faint),
+            ));
+            (" Delete rows ", lines)
+        }
         Confirm::Quit { drafts } => (
             " Quit? ",
             vec![

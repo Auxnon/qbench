@@ -36,11 +36,17 @@ the Charm-flavoured widgets from [ratatui-cheese](https://github.com/shashanktom
   warning by name about any draft that would **overwrite** an existing row. All drafts are then written
   in one transaction, so any error rolls back the whole batch and keeps the drafts. <kbd>dd</kbd>
   discards a draft. You can't page, reload, switch tables or quit without confirming while drafts exist.
+- **Delete rows.** <kbd>dd</kbd> on a saved row, or <kbd>v</kbd> to select rows in visual mode then
+  <kbd>d</kbd>, opens a confirmation listing how many rows will go and their keys. Deletes run in one
+  transaction. Each must match exactly one row (by primary key, or ctid), otherwise nothing is deleted.
+  Foreign-key errors are shown and rolled back. In visual mode, <kbd>y</kbd> yanks the selected rows
+  as TSV.
 - **Vim-style keys:** `hjkl`, `w`/`e`/`b` between columns, `gg`/`G`, `H`/`M`/`L`, `Ctrl+d/u/f/b`, and
   `i`/`a`/`s`/`cc` to edit. <kbd>Y</kbd> / <kbd>yy</kbd> yanks a cell to the system clipboard (wl-copy,
   xclip, xsel or pbcopy, otherwise OSC 52), and <kbd>p</kbd> pastes it into another cell.
 - **Mouse:** click a table to open it, click a cell to select it, click it again to edit, click a
-  dropdown option to apply it, and scroll with the wheel. Pass `--no-mouse` to keep the terminal's own
+  dropdown option to apply it, and Shift+click to extend a visual selection. The wheel scrolls rows;
+  a tilt wheel or trackpad side-scroll, or Shift+wheel, moves between columns. Pass `--no-mouse` to keep the terminal's own
   text selection.
 - **Compact table list:** while the grid has focus, the table list shrinks to a narrow strip. It expands
   again when you focus it (<kbd>Esc</kbd>, <kbd>Tab</kbd>, <kbd>Ctrl+H</kbd> or a click).
@@ -85,11 +91,12 @@ cargo run -- postgres://postgres:qbench@localhost:55432/postgres
 | Anywhere | `tab` switch pane · `?` full help · `q` / `ctrl+c` quit · `r` refresh |
 | Tables | `↑↓`/`jk` move · `enter` open · `/` fuzzy filter · `esc` clear filter |
 | Grid motion | `←↑↓→`/`hjkl` · `w`/`e` next column · `b` previous column · `gg`/`G` first/last row · `^`/`$` first/last column · `H`/`M`/`L` top/middle/bottom of screen · `ctrl+d/u` half page · `ctrl+f/b`, `pgup`/`pgdn` full page · `[`/`]` previous/next page |
-| Grid editing | `enter`/`a` edit · `i` edit, cursor at start · `s`/`cc` replace value · `Y`/`yy` yank · `p` paste · `o`/`O` clone row · `dd` discard draft · `ctrl+s` commit drafts |
+| Grid editing | `enter`/`a` edit · `i` edit, cursor at start · `s`/`cc` replace value · `Y`/`yy` yank · `p` paste · `o`/`O` clone row · `dd` delete row (confirms) or discard draft · `ctrl+s` commit drafts |
+| Visual | `v`/`V` start · any motion extends · `d`/`x` delete selected rows (confirms) · `y` yank rows as TSV · `esc`/`v` exit |
 | Panes | `esc`/`ctrl+h` table list · `ctrl+l` grid · `/` filter tables |
 | Dropdown | type to fuzzy find · `↑↓`, `tab`, `ctrl+j/k` select · `enter` or click apply · `esc` cancel |
 | Text edit | `enter` save · `ctrl+n` NULL · `ctrl+d` DEFAULT · `ctrl+u` clear · `esc` cancel |
-| Mouse | click table to open · click cell to select, click again to edit · wheel scrolls |
+| Mouse | click table to open · click cell to select, click again to edit · shift+click extend selection · wheel scrolls rows · side-scroll / shift+wheel scrolls columns |
 | Favorites | `f` toggle · `F` list · `1`–`9`, `0` open · `alt+1`–`0` open from anywhere · `d` remove (in list) |
 
 ## How it talks to Postgres

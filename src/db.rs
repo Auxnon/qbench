@@ -213,6 +213,11 @@ pub enum Response {
         inserted: usize,
         overwritten: usize,
     },
+    /// ctids of the rows that were deleted.
+    Deleted {
+        table: TableRef,
+        ctids: Vec<String>,
+    },
     Error(String),
 }
 
@@ -268,6 +273,13 @@ impl Db {
                 table: info.table,
                 collisions,
             })
+        });
+    }
+
+    pub fn delete_rows(&self, info: TableInfo, columns: Vec<Column>, rows: Vec<DataRow>) {
+        let pool = self.pool.clone();
+        self.spawn("delete failed, nothing was deleted", async move {
+            delete_rows(&pool, info, columns, rows).await
         });
     }
 
@@ -440,6 +452,31 @@ async fn fetch_table(pool: &PgPool, info: TableInfo, page: usize, page_size: usi
 
 /// Writes one cell. Rows are addressed by primary key when there is one and by
 /// ctid otherwise; values travel as text and are cast server-side to the column type.
+/// `where` condition addressing a saved row: by primary key when there is one, else by ctid.
+fn row_condition(
+    info: &TableInfo,
+    columns: &[Column],
+    row: &DataRow,
+    binds: &mut Vec<Option<String>>,
+) -> Result<String> {
+    let mut conds = Vec::new();
+    for (i, c) in columns.iter().enumerate().filter(|(_, c)| c.is_pk) {
+        binds.push(row.values[i].clone());
+        conds.push(format!("{} = ${}::{}", quote_ident(&c.name), binds.len(), c.type_name));
+    }
+    if conds.is_empty() {
+        let Some(ctid) = row.ctid.clone() else {
+            bail!(
+                "{} has no primary key and no ctid; rows can't be addressed",
+                info.table.full()
+            );
+        };
+        binds.push(Some(ctid));
+        conds.push(format!("ctid = ${}::tid", binds.len()));
+    }
+    Ok(conds.join(" and "))
+}
+
 async fn update_cell(pool: &PgPool, u: CellUpdate) -> Result<Response> {
     let col = &u.columns[u.col];
     let mut binds: Vec<Option<String>> = Vec::new();
@@ -453,29 +490,11 @@ async fn update_cell(pool: &PgPool, u: CellUpdate) -> Result<Response> {
             format!("$1::{}", col.type_name)
         }
     };
-    let pk_idx: Vec<usize> = (0..u.columns.len()).filter(|&i| u.columns[i].is_pk).collect();
-    let mut conds = Vec::new();
-    if pk_idx.is_empty() {
-        let Some(ctid) = u.row.ctid.clone() else {
-            bail!(
-                "{} has no primary key and no ctid; it cannot be edited",
-                u.info.table.full()
-            );
-        };
-        binds.push(Some(ctid));
-        conds.push(format!("ctid = ${}::tid", binds.len()));
-    } else {
-        for i in pk_idx {
-            binds.push(u.row.values[i].clone());
-            let c = &u.columns[i];
-            conds.push(format!("{} = ${}::{}", quote_ident(&c.name), binds.len(), c.type_name));
-        }
-    }
+    let cond = row_condition(&u.info, &u.columns, &u.row, &mut binds)?;
     let sql = format!(
-        "update {} set {} = {set_expr} where {} returning {}",
+        "update {} set {} = {set_expr} where {cond} returning {}",
         u.info.table.qualified(),
         quote_ident(&col.name),
-        conds.join(" and "),
         select_list(&u.columns, true),
     );
     let mut q = sqlx::query(&sql);
@@ -518,14 +537,19 @@ fn key_condition(columns: &[Column], row: &DataRow, binds: &mut Vec<Option<Strin
     (!conds.is_empty()).then(|| conds.join(" and "))
 }
 
-fn key_label(columns: &[Column], row: &DataRow) -> String {
-    columns
+/// Human-readable row key: primary key values, or the ctid for tables without one.
+pub fn key_label(columns: &[Column], row: &DataRow) -> String {
+    let pk: Vec<String> = columns
         .iter()
         .enumerate()
         .filter(|(_, c)| c.is_pk)
         .map(|(i, c)| format!("{}={}", c.name, row.values[i].as_deref().unwrap_or("NULL")))
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect();
+    if pk.is_empty() {
+        format!("ctid {}", row.ctid.as_deref().unwrap_or("?"))
+    } else {
+        pk.join(", ")
+    }
 }
 
 async fn find_collisions(
@@ -613,5 +637,34 @@ async fn insert_rows(pool: &PgPool, b: InsertBatch) -> Result<Response> {
         table: b.info.table,
         inserted: b.rows.len() - overwritten,
         overwritten,
+    })
+}
+
+/// Deletes saved rows in one transaction. Each must match exactly one row, or nothing is deleted.
+async fn delete_rows(pool: &PgPool, info: TableInfo, columns: Vec<Column>, rows: Vec<DataRow>) -> Result<Response> {
+    let mut tx = pool.begin().await?;
+    let mut ctids = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut binds = Vec::new();
+        let cond = row_condition(&info, &columns, row, &mut binds)?;
+        let sql = format!("delete from {} where {cond}", info.table.qualified());
+        let mut q = sqlx::query(&sql);
+        for b in binds {
+            q = q.bind(b);
+        }
+        let n = q.execute(&mut *tx).await?.rows_affected();
+        if n != 1 {
+            tx.rollback().await?;
+            bail!(
+                "{} matched {n} rows (changed elsewhere?) — press r to refresh",
+                key_label(&columns, row)
+            );
+        }
+        ctids.extend(row.ctid.clone());
+    }
+    tx.commit().await?;
+    Ok(Response::Deleted {
+        table: info.table,
+        ctids,
     })
 }
