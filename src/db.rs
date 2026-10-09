@@ -87,6 +87,41 @@ pub struct Column {
     pub nullable: bool,
     pub is_pk: bool,
     pub kind: ColKind,
+    /// Has a column default or is an identity column.
+    pub has_default: bool,
+    /// `GENERATED ALWAYS AS IDENTITY`: explicit values need `OVERRIDING SYSTEM VALUE`.
+    pub identity_always: bool,
+    /// Stored generated column; never written directly.
+    pub generated: bool,
+}
+
+impl Column {
+    /// Filled in by the database on insert (serial, identity, uuid default, …) when it is a key.
+    pub fn auto_key(&self) -> bool {
+        self.generated || (self.has_default && self.is_pk) || self.identity_always
+    }
+}
+
+/// A value to write into a cell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CellValue {
+    Value(String),
+    Null,
+    Default,
+}
+
+impl CellValue {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Value(v) => v,
+            Self::Null => "NULL",
+            Self::Default => "DEFAULT",
+        }
+    }
+
+    pub fn from_opt(v: Option<String>) -> Self {
+        v.map_or(Self::Null, Self::Value)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +129,27 @@ pub struct DataRow {
     /// Physical row id, used to address rows of tables without a primary key.
     pub ctid: Option<String>,
     pub values: Vec<Option<String>>,
+    /// Staged rows that exist only locally until committed. Holds, per column,
+    /// whether the cell is left to the database default.
+    pub draft: Option<Vec<bool>>,
+}
+
+impl DataRow {
+    pub fn is_draft(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    pub fn is_default(&self, col: usize) -> bool {
+        self.draft.as_ref().is_some_and(|d| d[col])
+    }
+
+    pub fn cell(&self, col: usize) -> CellValue {
+        if self.is_default(col) {
+            CellValue::Default
+        } else {
+            CellValue::from_opt(self.values[col].clone())
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +166,10 @@ impl TableData {
     pub fn has_pk(&self) -> bool {
         self.columns.iter().any(|c| c.is_pk)
     }
+
+    pub fn draft_count(&self) -> usize {
+        self.rows.iter().filter(|r| r.is_draft()).count()
+    }
 }
 
 pub struct CellUpdate {
@@ -118,7 +178,15 @@ pub struct CellUpdate {
     pub row_idx: usize,
     pub row: DataRow,
     pub col: usize,
-    pub value: Option<String>,
+    pub value: CellValue,
+}
+
+pub struct InsertBatch {
+    pub info: TableInfo,
+    pub columns: Vec<Column>,
+    pub rows: Vec<DataRow>,
+    /// Per row: upsert over an existing row with the same primary key.
+    pub overwrite: Vec<bool>,
 }
 
 pub enum Response {
@@ -130,8 +198,20 @@ pub enum Response {
     RowUpdated {
         table: TableRef,
         row_idx: usize,
+        /// ctid the row had before the update, to find it again if rows shifted.
+        old_ctid: Option<String>,
         column: String,
         row: DataRow,
+    },
+    /// Result of checking drafts against existing keys: (draft index, key description).
+    InsertChecked {
+        table: TableRef,
+        collisions: Vec<(usize, String)>,
+    },
+    Inserted {
+        table: TableRef,
+        inserted: usize,
+        overwritten: usize,
     },
     Error(String),
 }
@@ -179,6 +259,24 @@ impl Db {
         let pool = self.pool.clone();
         self.spawn("update failed", async move { update_cell(&pool, upd).await });
     }
+
+    pub fn check_inserts(&self, info: TableInfo, columns: Vec<Column>, rows: Vec<DataRow>) {
+        let pool = self.pool.clone();
+        self.spawn("checking keys", async move {
+            let collisions = find_collisions(&pool, &info, &columns, &rows).await?;
+            Ok(Response::InsertChecked {
+                table: info.table,
+                collisions,
+            })
+        });
+    }
+
+    pub fn insert_rows(&self, batch: InsertBatch) {
+        let pool = self.pool.clone();
+        self.spawn("insert failed, nothing was written", async move {
+            insert_rows(&pool, batch).await
+        });
+    }
 }
 
 fn error_text(e: &anyhow::Error) -> String {
@@ -213,7 +311,10 @@ const COLUMNS_QUERY: &str = "
            case when bt.typtype = 'e' then array(
                select e.enumlabel::text from pg_enum e
                where e.enumtypid = bt.oid order by e.enumsortorder)
-           end
+           end,
+           a.atthasdef or a.attidentity <> '',
+           a.attidentity = 'a',
+           a.attgenerated <> ''
     from pg_attribute a
     join pg_type t on t.oid = a.atttypid
     join pg_type bt on bt.oid = case when t.typtype = 'd' then t.typbasetype else t.oid end
@@ -260,6 +361,9 @@ async fn fetch_columns(pool: &PgPool, t: &TableRef) -> Result<Vec<Column>> {
                     (None, true) => ColKind::Bool,
                     _ => ColKind::Other,
                 },
+                has_default: r.try_get(6)?,
+                identity_always: r.try_get(7)?,
+                generated: r.try_get(8)?,
             })
         })
         .collect()
@@ -287,7 +391,11 @@ fn decode_row(r: &sqlx::postgres::PgRow, with_ctid: bool, ncols: usize) -> Resul
     let values = (0..ncols)
         .map(|i| r.try_get::<Option<String>, _>(i + off))
         .collect::<Result<_, _>>()?;
-    Ok(DataRow { ctid, values })
+    Ok(DataRow {
+        ctid,
+        values,
+        draft: None,
+    })
 }
 
 async fn fetch_table(pool: &PgPool, info: TableInfo, page: usize, page_size: usize) -> Result<TableData> {
@@ -334,7 +442,17 @@ async fn fetch_table(pool: &PgPool, info: TableInfo, page: usize, page_size: usi
 /// ctid otherwise; values travel as text and are cast server-side to the column type.
 async fn update_cell(pool: &PgPool, u: CellUpdate) -> Result<Response> {
     let col = &u.columns[u.col];
-    let mut binds: Vec<Option<String>> = vec![u.value.clone()];
+    let mut binds: Vec<Option<String>> = Vec::new();
+    let set_expr = match &u.value {
+        CellValue::Default => "DEFAULT".to_string(),
+        v => {
+            binds.push(match v {
+                CellValue::Value(s) => Some(s.clone()),
+                _ => None,
+            });
+            format!("$1::{}", col.type_name)
+        }
+    };
     let pk_idx: Vec<usize> = (0..u.columns.len()).filter(|&i| u.columns[i].is_pk).collect();
     let mut conds = Vec::new();
     if pk_idx.is_empty() {
@@ -354,10 +472,9 @@ async fn update_cell(pool: &PgPool, u: CellUpdate) -> Result<Response> {
         }
     }
     let sql = format!(
-        "update {} set {} = $1::{} where {} returning {}",
+        "update {} set {} = {set_expr} where {} returning {}",
         u.info.table.qualified(),
         quote_ident(&col.name),
-        col.type_name,
         conds.join(" and "),
         select_list(&u.columns, true),
     );
@@ -382,7 +499,119 @@ async fn update_cell(pool: &PgPool, u: CellUpdate) -> Result<Response> {
     Ok(Response::RowUpdated {
         table: u.info.table,
         row_idx: u.row_idx,
+        old_ctid: u.row.ctid,
         column: col.name.clone(),
         row,
+    })
+}
+
+/// Primary-key condition for a draft, or `None` when part of the key is left to the database.
+fn key_condition(columns: &[Column], row: &DataRow, binds: &mut Vec<Option<String>>) -> Option<String> {
+    let mut conds = Vec::new();
+    for (i, c) in columns.iter().enumerate().filter(|(_, c)| c.is_pk) {
+        if row.is_default(i) {
+            return None;
+        }
+        binds.push(row.values[i].clone());
+        conds.push(format!("{} = ${}::{}", quote_ident(&c.name), binds.len(), c.type_name));
+    }
+    (!conds.is_empty()).then(|| conds.join(" and "))
+}
+
+fn key_label(columns: &[Column], row: &DataRow) -> String {
+    columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_pk)
+        .map(|(i, c)| format!("{}={}", c.name, row.values[i].as_deref().unwrap_or("NULL")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn find_collisions(
+    pool: &PgPool,
+    info: &TableInfo,
+    columns: &[Column],
+    rows: &[DataRow],
+) -> Result<Vec<(usize, String)>> {
+    let mut out = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let mut binds = Vec::new();
+        let Some(cond) = key_condition(columns, row, &mut binds) else {
+            continue;
+        };
+        let sql = format!("select exists(select 1 from {} where {cond})", info.table.qualified());
+        let mut q = sqlx::query_scalar::<_, bool>(&sql);
+        for b in binds {
+            q = q.bind(b);
+        }
+        if q.fetch_one(pool).await? {
+            out.push((i, key_label(columns, row)));
+        }
+    }
+    Ok(out)
+}
+
+/// Inserts every draft in one transaction; any failure rolls back the whole batch.
+async fn insert_rows(pool: &PgPool, b: InsertBatch) -> Result<Response> {
+    let pk_list: Vec<String> = b
+        .columns
+        .iter()
+        .filter(|c| c.is_pk)
+        .map(|c| quote_ident(&c.name))
+        .collect();
+    let mut tx = pool.begin().await?;
+    let mut overwritten = 0;
+    for (row, &overwrite) in b.rows.iter().zip(&b.overwrite) {
+        let mut names = Vec::new();
+        let mut exprs = Vec::new();
+        let mut binds: Vec<Option<String>> = Vec::new();
+        let mut overriding = false;
+        for (i, c) in b.columns.iter().enumerate() {
+            if c.generated || row.is_default(i) {
+                continue;
+            }
+            binds.push(row.values[i].clone());
+            names.push(quote_ident(&c.name));
+            exprs.push(format!("${}::{}", binds.len(), c.type_name));
+            overriding |= c.identity_always;
+        }
+        let mut sql = if names.is_empty() {
+            format!("insert into {} default values", b.info.table.qualified())
+        } else {
+            format!(
+                "insert into {} ({}){} values ({})",
+                b.info.table.qualified(),
+                names.join(", "),
+                if overriding { " overriding system value" } else { "" },
+                exprs.join(", "),
+            )
+        };
+        if overwrite && !pk_list.is_empty() {
+            let sets: Vec<String> = b
+                .columns
+                .iter()
+                .filter(|c| !c.is_pk && !c.generated)
+                .map(|c| format!("{0} = excluded.{0}", quote_ident(&c.name)))
+                .collect();
+            sql.push_str(&format!(" on conflict ({}) do ", pk_list.join(", ")));
+            sql.push_str(&if sets.is_empty() {
+                "nothing".to_string()
+            } else {
+                format!("update set {}", sets.join(", "))
+            });
+            overwritten += 1;
+        }
+        let mut q = sqlx::query(&sql);
+        for v in binds {
+            q = q.bind(v);
+        }
+        q.execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(Response::Inserted {
+        table: b.info.table,
+        inserted: b.rows.len() - overwritten,
+        overwritten,
     })
 }

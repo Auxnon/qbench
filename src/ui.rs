@@ -14,19 +14,23 @@ use ratatui_cheese::paginator::{Paginator, PaginatorMode, PaginatorState, Pagina
 use ratatui_cheese::theme::Palette;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, EditorKind, Focus, Popup, StatusKind, choice_label};
-use crate::db::{ColKind, Column};
+use crate::app::{App, Confirm, EditorKind, Focus, Hits, Popup, StatusKind, choice_label};
+use crate::db::{CellValue, ColKind, Column};
 use crate::favorites::{self, MAX_FAVORITES};
 use crate::fuzzy;
 
 const STAR: Color = Color::Rgb(0xFF, 0xD7, 0x5F);
+/// Marks draft cells left to the database (serial / identity keys, defaults).
+const AUTO_MARK: &str = "✱ auto";
 const SIDEBAR_WIDTH: u16 = 32;
+const SIDEBAR_COLLAPSED: u16 = 16;
 const COL_GAP: u16 = 2;
 const MAX_COL_WIDTH: usize = 40;
 const MAX_DROPDOWN_ROWS: usize = 8;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let p = app.palette.clone();
+    app.hits = Hits::default();
     let area = f.area().inner(ratatui::layout::Margin {
         horizontal: 1,
         vertical: 0,
@@ -48,9 +52,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_title(f.buffer_mut(), title, app, &p);
 
-    let side_w = SIDEBAR_WIDTH.min(body.width / 3).max(16);
+    let collapsed = app.sidebar_collapsed();
+    let side_w = if collapsed {
+        SIDEBAR_COLLAPSED
+    } else {
+        SIDEBAR_WIDTH.min(body.width / 3).max(SIDEBAR_COLLAPSED)
+    };
     let [side, _, grid] =
         Layout::horizontal([Constraint::Length(side_w), Constraint::Length(2), Constraint::Fill(1)]).areas(body);
+    app.hits.sidebar = side;
+    app.hits.grid = grid;
     draw_sidebar(f, side, app, &p);
     draw_grid(f.buffer_mut(), grid, app, &p);
     draw_status(f.buffer_mut(), status, app, &p);
@@ -61,6 +72,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Popup::Favorites(_) => {
             let screen = f.area();
             draw_favorites(f.buffer_mut(), screen, app, &p);
+        }
+        Popup::Confirm(_) => {
+            let screen = f.area();
+            draw_confirm(f.buffer_mut(), screen, app, &p);
         }
         Popup::None => {}
     }
@@ -122,11 +137,16 @@ fn section_title_style(p: &Palette, focused: bool) -> Style {
 
 fn draw_sidebar(f: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
     let focused = app.focus == Focus::Tables && matches!(app.popup, Popup::None);
-    let bottom = format!(
-        "{} rel · ★ {}/{MAX_FAVORITES}",
-        app.tables.len(),
-        app.favorites.list().len()
-    );
+    let collapsed = app.sidebar_collapsed();
+    let bottom = if collapsed {
+        format!("★ {}/{MAX_FAVORITES}", app.favorites.list().len())
+    } else {
+        format!(
+            "{} rel · ★ {}/{MAX_FAVORITES}",
+            app.tables.len(),
+            app.favorites.list().len()
+        )
+    };
     let fs = Fieldset::new()
         .title("Tables")
         .title_bottom(&bottom)
@@ -141,10 +161,10 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
     }
 
     let filter_area = Rect { height: 1, ..inner };
-    let placeholder = if app.filter_active {
-        "fuzzy filter…"
-    } else {
-        "press / to filter"
+    let placeholder = match (app.filter_active, collapsed) {
+        (true, _) => "fuzzy filter…",
+        (false, true) => "",
+        (false, false) => "press / to filter",
     };
     let input = Input::new("").prompt("/").placeholder(placeholder).palette(p);
     f.render_stateful_widget(&input, filter_area, &mut app.filter);
@@ -199,8 +219,10 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
                 Span::raw("  ")
             },
         ];
-        let name = info.table.short();
-        let hits = fuzzy::positions(&query, &name);
+        let full_name = info.table.short();
+        // Leave room for the indicator and star columns.
+        let name = truncate(&full_name, (list.width as usize).saturating_sub(4));
+        let hits = fuzzy::positions(&query, &full_name);
         let dot = if info.table.schema == "public" {
             0
         } else {
@@ -218,13 +240,15 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &mut App, p: &Palette) {
             Span::styled(c.to_string(), st)
         }));
         let kind = info.kind.label();
-        if !kind.is_empty() {
+        if !kind.is_empty() && !collapsed {
             spans.push(Span::styled(
                 format!(" {kind}"),
                 Style::new().fg(p.faint).add_modifier(Modifier::ITALIC),
             ));
         }
+        let line_area = Rect { y, height: 1, ..list };
         buf.set_line(list.x, y, &Line::from(spans), list.width);
+        app.hits.tables.push((line_area, row));
     }
 }
 
@@ -316,10 +340,15 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
     };
 
     let first = d.page * d.page_size;
+    let drafts = d.draft_count();
     let title = format!(
-        "{}{}",
+        "{}{}{}",
         d.info.table.full(),
-        if d.info.kind.editable() { "" } else { " (read-only)" }
+        if d.info.kind.editable() { "" } else { " (read-only)" },
+        match drafts {
+            0 => String::new(),
+            n => format!(" · ✚ {n} draft{}", if n == 1 { "" } else { "s" }),
+        }
     );
     let bottom = if d.rows.is_empty() {
         format!("empty · {} rows", d.total)
@@ -350,7 +379,11 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
             let vals = d
                 .rows
                 .iter()
-                .map(|r| r.values[ci].as_deref().map_or(4, |v| display_value(v).width()))
+                .map(|r| match r.cell(ci) {
+                    CellValue::Value(v) => display_value(&v).width(),
+                    CellValue::Null => 4,
+                    CellValue::Default => AUTO_MARK.width(),
+                })
                 .max()
                 .unwrap_or(0);
             head.max(ty).max(vals).clamp(3, MAX_COL_WIDTH)
@@ -358,6 +391,15 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
         .collect();
 
     let gutter = (first + d.rows.len()).max(1).to_string().len() as u16 + 1;
+    // Saved-row numbering skips drafts.
+    let mut row_numbers = Vec::with_capacity(d.rows.len());
+    let mut n = first;
+    for r in &d.rows {
+        if !r.is_draft() {
+            n += 1;
+        }
+        row_numbers.push(n);
+    }
     let avail = inner.width.saturating_sub(gutter + 1) as usize;
     let span_width =
         |from: usize, to: usize| -> usize { widths[from..=to].iter().sum::<usize>() + (to - from) * COL_GAP as usize };
@@ -435,11 +477,18 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
                 Style::new().bg(p.surface),
             );
         }
-        let num = format!("{:>width$}", first + ri + 1, width = gutter as usize - 1);
-        let num_style = if row_selected {
-            Style::new().fg(p.primary)
+        let (num, num_style) = if row.is_draft() {
+            (
+                format!("{:>width$}", "+", width = gutter as usize - 1),
+                Style::new().fg(p.success).add_modifier(Modifier::BOLD),
+            )
         } else {
-            Style::new().fg(p.faint)
+            let st = if row_selected {
+                Style::new().fg(p.primary)
+            } else {
+                Style::new().fg(p.faint)
+            };
+            (format!("{:>width$}", row_numbers[ri], width = gutter as usize - 1), st)
         };
         buf.set_string(inner.x, y, num, num_style);
 
@@ -447,6 +496,10 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
             let c = &d.columns[ci];
             let cell_selected = row_selected && ci == app.cur_col;
             let (text, mut style) = match &row.values[ci] {
+                _ if row.is_default(ci) => (
+                    AUTO_MARK.to_string(),
+                    Style::new().fg(p.primary).add_modifier(Modifier::ITALIC),
+                ),
                 None => (
                     "NULL".to_string(),
                     Style::new().fg(p.faint).add_modifier(Modifier::ITALIC),
@@ -487,6 +540,17 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
                 app.cell_anchor = Some(cell);
             }
             buf.set_stringn(x + pad as u16, y, text, w, style);
+            let hit_w = (w as u16 + COL_GAP).min(right.saturating_sub(x));
+            app.hits.cells.push((
+                Rect {
+                    x,
+                    y,
+                    width: hit_w,
+                    height: 1,
+                },
+                ri,
+                ci,
+            ));
         }
     }
 }
@@ -540,6 +604,25 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, p: &Palette) {
     left.render(area, buf);
 
     let Some(d) = &app.data else { return };
+    let mut badges: Vec<Span> = Vec::new();
+    if let Some(k) = app.pending_key {
+        badges.push(Span::styled(
+            format!(" {k}… "),
+            Style::new().fg(p.on_highlight).bg(p.secondary),
+        ));
+        badges.push(Span::raw("  "));
+    }
+    let drafts = d.draft_count();
+    if drafts > 0 {
+        badges.push(Span::styled(
+            format!(" ✚ {drafts} draft{} ", if drafts == 1 { "" } else { "s" }),
+            Style::new()
+                .fg(p.on_highlight)
+                .bg(p.success)
+                .add_modifier(Modifier::BOLD),
+        ));
+        badges.push(Span::styled(" ctrl+s commit ", Style::new().fg(p.muted)));
+    }
     let pos = format!(
         "  row {}/{}  col {}/{}",
         d.page * d.page_size + app.cur_row + 1,
@@ -562,6 +645,18 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, p: &Palette) {
         )
     };
     let x = area.right().saturating_sub(pos_w + if pages > 1 { pw } else { 0 });
+    if !badges.is_empty() {
+        let line = Line::from(badges);
+        let bw = line.width() as u16 + 2;
+        line.render(
+            Rect {
+                x: x.saturating_sub(bw),
+                width: bw,
+                ..area
+            },
+            buf,
+        );
+    }
     if pages > 1 {
         let pager = Paginator::default().mode(mode).styles(PaginatorStyles::from_palette(p));
         ratatui::widgets::StatefulWidget::render(
@@ -595,11 +690,13 @@ fn help(app: &App, p: &Palette) -> Help {
             ],
             EditorKind::Text => vec![
                 Binding::new("enter", "save"),
-                Binding::new("ctrl+n", "set NULL"),
+                Binding::new("ctrl+n", "NULL"),
+                Binding::new("ctrl+d", "DEFAULT"),
                 Binding::new("ctrl+u", "clear"),
                 Binding::new("esc", "cancel"),
             ],
         },
+        (Popup::Confirm(_), _) => vec![Binding::new("y/enter", "confirm"), Binding::new("n/esc", "cancel")],
         (Popup::Favorites(_), _) => vec![
             Binding::new("1-0", "jump"),
             Binding::new("enter", "open"),
@@ -623,12 +720,12 @@ fn help(app: &App, p: &Palette) -> Help {
             Binding::new("q", "quit"),
         ],
         (Popup::None, Focus::Grid) => vec![
-            Binding::new("←↑↓→", "move"),
-            Binding::new("enter", "edit"),
+            Binding::new("hjkl/wb", "move"),
+            Binding::new("enter/i", "edit"),
+            Binding::new("Y/p", "yank/paste"),
+            Binding::new("o", "clone row"),
+            Binding::new("ctrl+s", "commit"),
             Binding::new("[/]", "page"),
-            Binding::new("f", "favorite"),
-            Binding::new("F", "favorites"),
-            Binding::new("r", "refresh"),
             Binding::new("esc", "tables"),
             Binding::new("?", "more"),
         ],
@@ -636,16 +733,29 @@ fn help(app: &App, p: &Palette) -> Help {
     let groups = vec![
         vec![
             Binding::new("←↑↓→/hjkl", "move"),
-            Binding::new("g/G", "first/last row"),
+            Binding::new("w/e  b", "next/prev col"),
+            Binding::new("gg/G", "first/last row"),
             Binding::new("^/$", "first/last col"),
-            Binding::new("pgup/pgdn", "scroll"),
+            Binding::new("H/M/L", "screen top/mid/bot"),
+            Binding::new("ctrl+d/u", "half page"),
+            Binding::new("ctrl+f/b", "full page"),
             Binding::new("[/]", "prev/next page"),
         ],
         vec![
-            Binding::new("enter/e", "edit cell"),
-            Binding::new("ctrl+n", "NULL (text)"),
+            Binding::new("enter/a", "edit cell"),
+            Binding::new("i", "edit at start"),
+            Binding::new("s/cc", "replace value"),
+            Binding::new("Y/yy", "yank cell"),
+            Binding::new("p", "paste into cell"),
+            Binding::new("click ×2", "edit cell"),
             Binding::new("r", "refresh"),
+        ],
+        vec![
+            Binding::new("o/O", "clone row below/above"),
+            Binding::new("dd", "discard draft"),
+            Binding::new("ctrl+s", "commit drafts"),
             Binding::new("tab", "switch pane"),
+            Binding::new("ctrl+h/l", "tables/grid"),
             Binding::new("/", "filter tables"),
         ],
         vec![
@@ -730,6 +840,7 @@ fn draw_editor(f: &mut Frame, app: &mut App, p: &Palette) {
             let shown = filtered.len().clamp(1, MAX_DROPDOWN_ROWS);
             let h = shown as u16 + 4;
             let rect = place_near(anchor, w, h, screen);
+            app.hits.popup = Some(rect);
             let block = popup_block(p, title, "↑↓ · enter · esc");
             let inner = block.inner(rect);
             f.render_widget(Clear, rect);
@@ -774,20 +885,26 @@ fn draw_editor(f: &mut Frame, app: &mut App, p: &Palette) {
                 let selected = row == *sel;
                 let opt = &options[oi];
                 let label = choice_label(opt);
-                let mut base = match opt.as_deref() {
-                    None => Style::new().fg(p.faint).add_modifier(Modifier::ITALIC),
-                    Some("true") if matches!(col.kind, ColKind::Bool) => Style::new().fg(p.success),
-                    Some("false") if matches!(col.kind, ColKind::Bool) => Style::new().fg(p.error),
-                    Some(_) => Style::new().fg(p.foreground),
+                let is_value = matches!(opt, CellValue::Value(_));
+                let mut base = match opt {
+                    CellValue::Null => Style::new().fg(p.faint).add_modifier(Modifier::ITALIC),
+                    CellValue::Default => Style::new().fg(p.primary).add_modifier(Modifier::ITALIC),
+                    CellValue::Value(v) if v == "true" && matches!(col.kind, ColKind::Bool) => {
+                        Style::new().fg(p.success)
+                    }
+                    CellValue::Value(v) if v == "false" && matches!(col.kind, ColKind::Bool) => {
+                        Style::new().fg(p.error)
+                    }
+                    CellValue::Value(_) => Style::new().fg(p.foreground),
                 };
                 if selected {
                     buf.set_style(Rect { y, height: 1, ..list }, Style::new().bg(p.surface));
                     base = base.add_modifier(Modifier::BOLD);
-                    if opt.is_some() && matches!(col.kind, ColKind::Enum(_)) {
+                    if is_value && matches!(col.kind, ColKind::Enum(_)) {
                         base = base.fg(p.primary);
                     }
                 }
-                let hits = if opt.is_some() {
+                let hits = if is_value {
                     fuzzy::positions(&query, label)
                 } else {
                     Vec::new()
@@ -809,6 +926,7 @@ fn draw_editor(f: &mut Frame, app: &mut App, p: &Palette) {
                     spans.push(Span::styled("  ● current", Style::new().fg(p.faint)));
                 }
                 buf.set_line(list.x, y, &Line::from(spans), list.width);
+                app.hits.options.push((Rect { y, height: 1, ..list }, row));
             }
         }
         EditorKind::Text => {
@@ -816,29 +934,37 @@ fn draw_editor(f: &mut Frame, app: &mut App, p: &Palette) {
                 .clamp(44, screen.width.saturating_sub(4).max(44))
                 .max(anchor_w);
             let w = w.min(80.max(anchor_w));
-            let hint = if col.nullable {
-                "enter save · ctrl+n NULL · esc"
-            } else {
-                "enter save · esc"
+            let hint = match (col.nullable, col.has_default) {
+                (true, true) => "enter save · ctrl+n NULL · ctrl+d DEFAULT · esc",
+                (true, false) => "enter save · ctrl+n NULL · esc",
+                (false, true) => "enter save · ctrl+d DEFAULT · esc",
+                (false, false) => "enter save · esc",
             };
+            let w = w.max(hint.width() as u16 + 6);
             let rect = place_near(anchor, w, 3, screen);
+            app.hits.popup = Some(rect);
             let block = popup_block(p, title, hint);
             let inner = block.inner(rect);
             f.render_widget(Clear, rect);
             f.render_widget(block, rect);
-            let placeholder = if ed.current.is_none() { "NULL" } else { "empty string" };
+            let placeholder = match ed.current {
+                CellValue::Null => "NULL",
+                CellValue::Default => "DEFAULT",
+                CellValue::Value(_) => "empty string",
+            };
             let input = Input::new("").prompt("›").placeholder(placeholder).palette(p);
             f.render_stateful_widget(&input, inner, &mut ed.input);
         }
     }
 }
 
-fn draw_favorites(buf: &mut Buffer, screen: Rect, app: &App, p: &Palette) {
+fn draw_favorites(buf: &mut Buffer, screen: Rect, app: &mut App, p: &Palette) {
     let Popup::Favorites(picker) = &app.popup else { return };
     let favs = app.favorites.list();
     let w = favs.iter().map(|t| t.full().width()).max().unwrap_or(0).max(36) as u16 + 14;
     let h = favs.len().max(1) as u16 + 4;
     let rect = place_near(None, w, h, screen);
+    app.hits.popup = Some(rect);
     let title = Line::from(vec![
         Span::styled(" ★ ", Style::new().fg(STAR)),
         Span::styled("Favorites ", Style::new().fg(p.secondary).add_modifier(Modifier::BOLD)),
@@ -862,8 +988,10 @@ fn draw_favorites(buf: &mut Buffer, screen: Rect, app: &App, p: &Palette) {
             .render(Rect { height: 2, ..inner }, buf);
         return;
     }
+    let mut option_hits = Vec::new();
     for (i, t) in favs.iter().enumerate().take(inner.height as usize) {
         let y = inner.y + i as u16;
+        option_hits.push((Rect { y, height: 1, ..inner }, i));
         let selected = i == picker.sel;
         if selected {
             buf.set_style(Rect { y, height: 1, ..inner }, Style::new().bg(p.surface));
@@ -894,4 +1022,89 @@ fn draw_favorites(buf: &mut Buffer, screen: Rect, app: &App, p: &Palette) {
         }
         buf.set_line(inner.x, y, &Line::from(spans), inner.width);
     }
+    app.hits.options = option_hits;
+}
+
+fn draw_confirm(buf: &mut Buffer, screen: Rect, app: &mut App, p: &Palette) {
+    let Popup::Confirm(confirm) = &app.popup else { return };
+    let warn = Style::new().fg(p.error).add_modifier(Modifier::BOLD);
+    let (title, mut lines) = match confirm {
+        Confirm::Quit { drafts } => (
+            " Quit? ",
+            vec![
+                Line::styled(format!("{drafts} uncommitted draft row(s) will be lost."), warn),
+                Line::raw(""),
+                Line::styled("ctrl+s commits them instead.", Style::new().fg(p.muted)),
+            ],
+        ),
+        Confirm::Insert {
+            table,
+            rows,
+            collisions,
+        } => {
+            let n = rows.len();
+            let mut lines = vec![Line::from(vec![
+                Span::styled(
+                    format!("Insert {n} row{}", if n == 1 { "" } else { "s" }),
+                    Style::new().fg(p.foreground).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" into ", Style::new().fg(p.muted)),
+                Span::styled(table.full(), Style::new().fg(p.secondary).add_modifier(Modifier::BOLD)),
+            ])];
+            let auto = rows
+                .iter()
+                .filter(|r| r.draft.as_ref().is_some_and(|d| d.iter().any(|&x| x)))
+                .count();
+            if auto > 0 {
+                lines.push(Line::styled(
+                    format!("✱ {auto} row(s) take database defaults (e.g. generated keys)"),
+                    Style::new().fg(p.primary),
+                ));
+            }
+            lines.push(Line::raw(""));
+            if collisions.is_empty() {
+                lines.push(Line::styled(
+                    "✓ no key collisions with existing rows",
+                    Style::new().fg(p.success),
+                ));
+            } else {
+                lines.push(Line::styled(
+                    format!("⚠ {} row(s) will OVERWRITE existing rows:", collisions.len()),
+                    warn,
+                ));
+                for (_, key) in collisions.iter().take(8) {
+                    lines.push(Line::styled(format!("    {key}"), Style::new().fg(p.error)));
+                }
+                if collisions.len() > 8 {
+                    lines.push(Line::styled(
+                        format!("    … and {} more", collisions.len() - 8),
+                        Style::new().fg(p.error),
+                    ));
+                }
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "All rows are written in one transaction.",
+                Style::new().fg(p.faint),
+            ));
+            (" Commit drafts ", lines)
+        }
+    };
+    lines.insert(0, Line::raw(""));
+    let w = lines.iter().map(Line::width).max().unwrap_or(30).max(40) as u16 + 6;
+    let h = lines.len() as u16 + 3;
+    let rect = place_near(None, w, h, screen);
+    app.hits.popup = Some(rect);
+    let block = popup_block(
+        p,
+        Line::styled(title, Style::new().fg(p.secondary).add_modifier(Modifier::BOLD)),
+        "y/enter confirm · n/esc cancel",
+    );
+    let inner = block.inner(rect).inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 0,
+    });
+    Clear.render(rect, buf);
+    block.render(rect, buf);
+    Paragraph::new(lines).render(inner, buf);
 }

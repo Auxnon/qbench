@@ -2,13 +2,14 @@
 
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Rect;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::{Position, Rect};
 use ratatui_cheese::input::InputState;
 use ratatui_cheese::spinner::{SpinnerState, SpinnerType};
 use ratatui_cheese::theme::Palette;
 
-use crate::db::{CellUpdate, ColKind, Db, Response, TableData, TableInfo, TableRef};
+use crate::clipboard;
+use crate::db::{CellUpdate, CellValue, ColKind, DataRow, Db, InsertBatch, Response, TableData, TableInfo, TableRef};
 use crate::favorites::{self, Favorites};
 use crate::fuzzy;
 
@@ -31,8 +32,8 @@ pub struct Status {
     at: Instant,
 }
 
-/// One entry in a choice dropdown; `None` stands for SQL NULL.
-pub type Choice = Option<String>;
+/// One entry in a choice dropdown.
+pub type Choice = CellValue;
 
 pub enum EditorKind {
     /// Enum / bool columns: fuzzy-filtered dropdown.
@@ -50,7 +51,7 @@ pub struct Editor {
     pub col: usize,
     pub input: InputState,
     pub kind: EditorKind,
-    pub current: Option<String>,
+    pub current: CellValue,
 }
 
 impl Editor {
@@ -64,17 +65,56 @@ impl Editor {
 }
 
 pub fn choice_label(c: &Choice) -> &str {
-    c.as_deref().unwrap_or("NULL")
+    c.label()
+}
+
+/// Where the cursor starts when a text editor opens (vim `i` / `a` / `s`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EditStart {
+    Start,
+    End,
+    Replace,
+}
+
+/// Screen regions recorded by the renderer each frame, for mouse hit-testing.
+#[derive(Default)]
+pub struct Hits {
+    pub sidebar: Rect,
+    pub grid: Rect,
+    /// Sidebar rows → index into `visible_tables`.
+    pub tables: Vec<(Rect, usize)>,
+    /// Grid cells → (row, column).
+    pub cells: Vec<(Rect, usize, usize)>,
+    pub popup: Option<Rect>,
+    /// Popup rows → dropdown position or favorite index.
+    pub options: Vec<(Rect, usize)>,
+}
+
+fn hit<T: Copy>(regions: &[(Rect, T)], pos: Position) -> Option<T> {
+    regions.iter().find(|(r, _)| r.contains(pos)).map(|&(_, v)| v)
 }
 
 pub struct FavPicker {
     pub sel: usize,
 }
 
+pub enum Confirm {
+    /// Commit staged rows; `collisions` lists drafts whose key already exists.
+    Insert {
+        table: TableRef,
+        rows: Vec<DataRow>,
+        collisions: Vec<(usize, String)>,
+    },
+    Quit {
+        drafts: usize,
+    },
+}
+
 pub enum Popup {
     None,
     Editor(Editor),
     Favorites(FavPicker),
+    Confirm(Confirm),
 }
 
 pub struct App {
@@ -103,6 +143,12 @@ pub struct App {
     /// Set by the renderer: data rows that fit on screen, and where the selected cell was drawn.
     pub grid_rows_visible: usize,
     pub cell_anchor: Option<Rect>,
+    pub hits: Hits,
+
+    /// First key of a two-key vim sequence (`gg`, `yy`, `cc`).
+    pub pending_key: Option<char>,
+    /// Last yanked cell.
+    register: Option<CellValue>,
 
     pub focus: Focus,
     pub popup: Popup,
@@ -139,6 +185,9 @@ impl App {
             col_scroll: 0,
             grid_rows_visible: 1,
             cell_anchor: None,
+            hits: Hits::default(),
+            pending_key: None,
+            register: None,
             focus: Focus::Tables,
             popup: Popup::None,
             show_full_help: false,
@@ -161,6 +210,11 @@ impl App {
                 self.status = None;
             }
         }
+    }
+
+    /// The table list shrinks to a narrow rail while the grid has focus.
+    pub fn sidebar_collapsed(&self) -> bool {
+        self.focus == Focus::Grid && (self.data.is_some() || self.loading.is_some())
     }
 
     fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {
@@ -208,16 +262,53 @@ impl App {
             Response::RowUpdated {
                 table,
                 row_idx,
+                old_ctid,
                 column,
                 row,
             } => {
                 if let Some(d) = &mut self.data
                     && d.info.table == table
-                    && row_idx < d.rows.len()
                 {
-                    d.rows[row_idx] = row;
+                    // Drafts may have been inserted since; prefer finding the row by its old ctid.
+                    let idx = old_ctid
+                        .as_ref()
+                        .and_then(|c| d.rows.iter().position(|r| r.ctid.as_ref() == Some(c)))
+                        .or((row_idx < d.rows.len() && !d.rows[row_idx].is_draft()).then_some(row_idx));
+                    if let Some(i) = idx {
+                        d.rows[i] = row;
+                    }
                 }
                 self.set_status(StatusKind::Success, format!("saved {}.{column}", table.short()));
+            }
+            Response::InsertChecked { table, collisions } => {
+                let Some(d) = &self.data else { return };
+                if d.info.table != table || d.draft_count() == 0 {
+                    return;
+                }
+                let rows = d.rows.iter().filter(|r| r.is_draft()).cloned().collect();
+                self.popup = Popup::Confirm(Confirm::Insert {
+                    table,
+                    rows,
+                    collisions,
+                });
+            }
+            Response::Inserted {
+                table,
+                inserted,
+                overwritten,
+            } => {
+                let mut msg = format!("inserted {inserted} row{}", if inserted == 1 { "" } else { "s" });
+                if overwritten > 0 {
+                    msg.push_str(&format!(", overwrote {overwritten}"));
+                }
+                self.set_status(StatusKind::Success, format!("{msg} into {}", table.short()));
+                if let Some(d) = &mut self.data
+                    && d.info.table == table
+                {
+                    d.rows.retain(|r| !r.is_draft());
+                    let (info, page) = (d.info.clone(), d.page);
+                    self.open_table(info, page);
+                }
             }
             Response::Error(e) => {
                 if self.pending == 0 {
@@ -252,7 +343,20 @@ impl App {
         self.visible_tables.get(self.table_sel).map(|&i| &self.tables[i])
     }
 
-    fn open_table(&mut self, info: TableInfo, page: usize) {
+    fn draft_count(&self) -> usize {
+        self.data.as_ref().map_or(0, TableData::draft_count)
+    }
+
+    /// Starts loading a table page. Refuses while drafts are staged, since a reload would drop them.
+    fn open_table(&mut self, info: TableInfo, page: usize) -> bool {
+        let drafts = self.draft_count();
+        if drafts > 0 {
+            self.set_status(
+                StatusKind::Error,
+                format!("{drafts} uncommitted draft row(s): ctrl+s to commit or dd to discard"),
+            );
+            return false;
+        }
         // Drop the old grid when switching tables so no key can edit it while the new one loads.
         if self.data.as_ref().is_some_and(|d| d.info.table != info.table) {
             self.data = None;
@@ -261,6 +365,7 @@ impl App {
         self.seq += 1;
         self.pending += 1;
         self.db.load_table(self.seq, info, page, self.page_size);
+        true
     }
 
     fn open_table_ref(&mut self, t: &TableRef) {
@@ -280,8 +385,9 @@ impl App {
                 self.table_sel = v;
             }
         }
-        self.open_table(info, 0);
-        self.focus = Focus::Grid;
+        if self.open_table(info, 0) {
+            self.focus = Focus::Grid;
+        }
     }
 
     fn open_favorite(&mut self, idx: usize) {
@@ -314,7 +420,9 @@ impl App {
     fn reload(&mut self) {
         if let Some(d) = &self.data {
             let (info, page) = (d.info.clone(), d.page);
-            self.open_table(info, page);
+            if !self.open_table(info, page) {
+                return;
+            }
         }
         self.pending += 1;
         self.db.load_tables();
@@ -345,14 +453,29 @@ impl App {
         match self.popup {
             Popup::Editor(_) => return self.on_editor_key(key),
             Popup::Favorites(_) => return self.on_favorites_key(key),
+            Popup::Confirm(_) => return self.on_confirm_key(key),
             Popup::None => {}
+        }
+        if ctrl && key.code == KeyCode::Char('s') {
+            return self.commit_drafts();
         }
         if self.focus == Focus::Tables && self.filter_active {
             return self.on_filter_key(key);
         }
 
+        // Mid-sequence (`g…`, `y…`) and ctrl chords go straight to the pane.
+        let pending = self.pending_key.take();
+        if pending.is_some() || ctrl {
+            return match self.focus {
+                Focus::Tables => self.on_tables_key(key, pending),
+                Focus::Grid => self.on_grid_key(key, pending),
+            };
+        }
         match key.code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => match self.draft_count() {
+                0 => self.quit = true,
+                drafts => self.popup = Popup::Confirm(Confirm::Quit { drafts }),
+            },
             KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
             KeyCode::Char('f') => self.toggle_favorite(),
             KeyCode::Char('F') => self.popup = Popup::Favorites(FavPicker { sel: 0 }),
@@ -369,37 +492,55 @@ impl App {
                 }
             }
             _ => match self.focus {
-                Focus::Tables => self.on_tables_key(key),
-                Focus::Grid => self.on_grid_key(key),
+                Focus::Tables => self.on_tables_key(key, None),
+                Focus::Grid => self.on_grid_key(key, None),
             },
         }
     }
 
-    fn on_tables_key(&mut self, key: KeyEvent) {
-        let n = self.visible_tables.len();
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.table_sel = self.table_sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.table_sel = (self.table_sel + 1).min(n.saturating_sub(1)),
-            KeyCode::PageUp => self.table_sel = self.table_sel.saturating_sub(10),
-            KeyCode::PageDown => self.table_sel = (self.table_sel + 10).min(n.saturating_sub(1)),
-            KeyCode::Home | KeyCode::Char('g') => self.table_sel = 0,
-            KeyCode::End | KeyCode::Char('G') => self.table_sel = n.saturating_sub(1),
-            KeyCode::Char('/') => {
-                self.filter_active = true;
-                self.filter.set_focused(true);
-            }
-            KeyCode::Esc if !self.filter.value().is_empty() => {
+    fn on_tables_key(&mut self, key: KeyEvent, pending: Option<char>) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let last = self.visible_tables.len().saturating_sub(1);
+        let sel = self.table_sel;
+        match (pending, key.code) {
+            (Some('g'), KeyCode::Char('g')) => self.table_sel = 0,
+            (_, KeyCode::Char('g')) if !ctrl => self.pending_key = Some('g'),
+            (_, KeyCode::Char('d')) if ctrl => self.table_sel = (sel + 10).min(last),
+            (_, KeyCode::Char('u')) if ctrl => self.table_sel = sel.saturating_sub(10),
+            (_, KeyCode::Char('l')) if ctrl => self.focus_grid(),
+            _ if ctrl => {}
+            (_, KeyCode::Up | KeyCode::Char('k')) => self.table_sel = sel.saturating_sub(1),
+            (_, KeyCode::Down | KeyCode::Char('j')) => self.table_sel = (sel + 1).min(last),
+            (_, KeyCode::PageUp) => self.table_sel = sel.saturating_sub(10),
+            (_, KeyCode::PageDown) => self.table_sel = (sel + 10).min(last),
+            (_, KeyCode::Home) => self.table_sel = 0,
+            (_, KeyCode::End | KeyCode::Char('G')) => self.table_sel = last,
+            (_, KeyCode::Char('/')) => self.start_filter(),
+            (_, KeyCode::Esc) if !self.filter.value().is_empty() => {
                 self.filter.set_value(String::new());
                 self.refilter_tables();
             }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_selected_table(),
+            (_, KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | 'o')) => self.open_selected_table(),
             _ => {}
         }
     }
 
+    fn start_filter(&mut self) {
+        self.focus = Focus::Tables;
+        self.filter_active = true;
+        self.filter.set_focused(true);
+    }
+
+    fn focus_grid(&mut self) {
+        if self.data.is_some() || self.loading.is_some() {
+            self.focus = Focus::Grid;
+        }
+    }
+
     fn open_selected_table(&mut self) {
-        if let Some(info) = self.selected_table().cloned() {
-            self.open_table(info, 0);
+        if let Some(info) = self.selected_table().cloned()
+            && self.open_table(info, 0)
+        {
             self.focus = Focus::Grid;
         }
     }
@@ -428,39 +569,218 @@ impl App {
         }
     }
 
-    fn on_grid_key(&mut self, key: KeyEvent) {
+    fn on_grid_key(&mut self, key: KeyEvent, pending: Option<char>) {
         let Some(d) = &self.data else {
             if self.loading.is_none() || key.code == KeyCode::Esc {
                 self.focus = Focus::Tables;
             }
             return;
         };
-        let (rows, cols) = (d.rows.len(), d.columns.len());
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let last_row = d.rows.len().saturating_sub(1);
+        let last_col = d.columns.len().saturating_sub(1);
         let last_page = (d.total.max(0) as usize).saturating_sub(1) / d.page_size.max(1);
         let page = d.page;
-        let jump = self.grid_rows_visible.max(1);
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.cur_row = self.cur_row.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.cur_row = (self.cur_row + 1).min(rows.saturating_sub(1)),
-            KeyCode::Left | KeyCode::Char('h') => self.cur_col = self.cur_col.saturating_sub(1),
-            KeyCode::Right | KeyCode::Char('l') => self.cur_col = (self.cur_col + 1).min(cols.saturating_sub(1)),
-            KeyCode::PageUp => self.cur_row = self.cur_row.saturating_sub(jump),
-            KeyCode::PageDown => self.cur_row = (self.cur_row + jump).min(rows.saturating_sub(1)),
-            KeyCode::Char('g') => self.cur_row = 0,
-            KeyCode::Char('G') => self.cur_row = rows.saturating_sub(1),
-            KeyCode::Home | KeyCode::Char('^') => self.cur_col = 0,
-            KeyCode::End | KeyCode::Char('$') => self.cur_col = cols.saturating_sub(1),
-            KeyCode::Char(']') if page < last_page => {
+        let screen = self.grid_rows_visible.max(1);
+        let half = (screen / 2).max(1);
+        // Last row currently on screen, for H / M / L.
+        let bottom = (self.row_scroll + screen - 1).min(last_row);
+        let (row, col) = (self.cur_row, self.cur_col);
+        match (pending, key.code) {
+            // Two-key sequences.
+            (Some('g'), KeyCode::Char('g')) => self.cur_row = 0,
+            (Some('y'), KeyCode::Char('y')) => self.yank_cell(),
+            (Some('c'), KeyCode::Char('c' | 'w' | 'W' | 'e' | 'E' | 'l' | '$')) => self.open_editor(EditStart::Replace),
+            (Some('d'), KeyCode::Char('d')) => self.discard_draft(),
+            (_, KeyCode::Char(c @ ('g' | 'y' | 'c' | 'd'))) if !ctrl => self.pending_key = Some(c),
+
+            // Ctrl chords: scrolling and pane switching.
+            (_, KeyCode::Char('d')) if ctrl => self.cur_row = (row + half).min(last_row),
+            (_, KeyCode::Char('u')) if ctrl => self.cur_row = row.saturating_sub(half),
+            (_, KeyCode::Char('f')) if ctrl => self.cur_row = (row + screen).min(last_row),
+            (_, KeyCode::Char('b')) if ctrl => self.cur_row = row.saturating_sub(screen),
+            (_, KeyCode::Char('h')) if ctrl => self.focus = Focus::Tables,
+            _ if ctrl => {}
+
+            // Motions.
+            (_, KeyCode::Up | KeyCode::Char('k')) => self.cur_row = row.saturating_sub(1),
+            (_, KeyCode::Down | KeyCode::Char('j')) => self.cur_row = (row + 1).min(last_row),
+            (_, KeyCode::Left | KeyCode::Char('h' | 'b' | 'B')) => self.cur_col = col.saturating_sub(1),
+            (_, KeyCode::Right | KeyCode::Char('l' | 'w' | 'W' | 'e' | 'E')) => self.cur_col = (col + 1).min(last_col),
+            (_, KeyCode::PageUp) => self.cur_row = row.saturating_sub(screen),
+            (_, KeyCode::PageDown) => self.cur_row = (row + screen).min(last_row),
+            (_, KeyCode::Char('G')) => self.cur_row = last_row,
+            (_, KeyCode::Char('H')) => self.cur_row = self.row_scroll.min(last_row),
+            (_, KeyCode::Char('M')) => self.cur_row = (self.row_scroll + bottom) / 2,
+            (_, KeyCode::Char('L')) => self.cur_row = bottom,
+            (_, KeyCode::Home | KeyCode::Char('^')) => self.cur_col = 0,
+            (_, KeyCode::End | KeyCode::Char('$')) => self.cur_col = last_col,
+            (_, KeyCode::Char(']')) if page < last_page => {
                 let info = d.info.clone();
                 self.open_table(info, page + 1);
             }
-            KeyCode::Char('[') if page > 0 => {
+            (_, KeyCode::Char('[')) if page > 0 => {
                 let info = d.info.clone();
                 self.open_table(info, page - 1);
             }
-            KeyCode::Enter | KeyCode::Char('e') => self.open_editor(),
-            KeyCode::Esc => self.focus = Focus::Tables,
+
+            // Editing.
+            (_, KeyCode::Enter | KeyCode::Char('a' | 'A')) => self.open_editor(EditStart::End),
+            (_, KeyCode::Char('i' | 'I')) => self.open_editor(EditStart::Start),
+            (_, KeyCode::Char('s' | 'S')) => self.open_editor(EditStart::Replace),
+            (_, KeyCode::Char('Y')) => self.yank_cell(),
+            (_, KeyCode::Char('p' | 'P')) => self.paste_cell(),
+            (_, KeyCode::Char('o')) => self.clone_row(false),
+            (_, KeyCode::Char('O')) => self.clone_row(true),
+
+            (_, KeyCode::Char('/')) => self.start_filter(),
+            (_, KeyCode::Esc) => self.focus = Focus::Tables,
             _ => {}
+        }
+    }
+
+    fn yank_cell(&mut self) {
+        let Some(value) = self
+            .data
+            .as_ref()
+            .and_then(|d| d.rows.get(self.cur_row))
+            .filter(|r| self.cur_col < r.values.len())
+            .map(|r| r.cell(self.cur_col))
+        else {
+            return;
+        };
+        let shown = match &value {
+            CellValue::Value(v) => {
+                let mut preview: String = v
+                    .chars()
+                    .take(40)
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect();
+                if v.chars().count() > 40 {
+                    preview.push('…');
+                }
+                format!("yanked \"{preview}\"")
+            }
+            other => format!("yanked {} (clipboard gets an empty string)", other.label()),
+        };
+        let via = clipboard::copy(match &value {
+            CellValue::Value(v) => v,
+            _ => "",
+        });
+        self.register = Some(value);
+        self.set_status(StatusKind::Success, format!("{shown} · {via}"));
+    }
+
+    fn paste_cell(&mut self) {
+        match self.register.clone() {
+            Some(value) => self.write_cell(self.cur_row, self.cur_col, value),
+            None => self.set_status(StatusKind::Info, "nothing yanked yet (Y or yy)"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Draft rows
+    // ---------------------------------------------------------------------
+
+    /// Stages a copy of the current row (below it, or above with `O`). Auto-filled
+    /// keys are left to the database and shown as ✱ until given a value.
+    fn clone_row(&mut self, above: bool) {
+        let Some(d) = &mut self.data else { return };
+        if !d.info.kind.editable() {
+            let kind = d.info.kind.label();
+            return self.set_status(StatusKind::Error, format!("can't insert into {kind}s"));
+        }
+        let Some(src) = d.rows.get(self.cur_row) else {
+            return self.set_status(StatusKind::Info, "no row to clone");
+        };
+        let defaults: Vec<bool> = d
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| c.auto_key() || src.is_default(i))
+            .collect();
+        let values = src
+            .values
+            .iter()
+            .zip(&defaults)
+            .map(|(v, &def)| if def { None } else { v.clone() })
+            .collect();
+        let draft = DataRow {
+            ctid: None,
+            values,
+            draft: Some(defaults),
+        };
+        let at = if above { self.cur_row } else { self.cur_row + 1 };
+        d.rows.insert(at, draft);
+        self.cur_row = at;
+        let n = d.draft_count();
+        self.set_status(
+            StatusKind::Info,
+            format!(
+                "{n} draft row{} · edit freely · ctrl+s commit · dd discard",
+                if n == 1 { "" } else { "s" }
+            ),
+        );
+    }
+
+    fn discard_draft(&mut self) {
+        let Some(d) = &mut self.data else { return };
+        if !d.rows.get(self.cur_row).is_some_and(DataRow::is_draft) {
+            return self.set_status(
+                StatusKind::Info,
+                "dd only discards draft rows; deleting saved rows isn't supported",
+            );
+        }
+        d.rows.remove(self.cur_row);
+        let left = d.draft_count();
+        self.clamp_cursor();
+        self.set_status(StatusKind::Info, format!("draft discarded · {left} left"));
+    }
+
+    /// Checks drafts against existing keys; the reply opens the confirmation.
+    fn commit_drafts(&mut self) {
+        let Some(d) = &self.data else { return };
+        let rows: Vec<DataRow> = d.rows.iter().filter(|r| r.is_draft()).cloned().collect();
+        if rows.is_empty() {
+            return self.set_status(StatusKind::Info, "no draft rows to commit (o clones a row)");
+        }
+        self.pending += 1;
+        self.db.check_inserts(d.info.clone(), d.columns.clone(), rows);
+    }
+
+    fn on_confirm_key(&mut self, key: KeyEvent) {
+        let yes = matches!(key.code, KeyCode::Char('y' | 'Y') | KeyCode::Enter);
+        let no = matches!(key.code, KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc);
+        if !yes && !no {
+            return;
+        }
+        let Popup::Confirm(confirm) = std::mem::replace(&mut self.popup, Popup::None) else {
+            return;
+        };
+        if no {
+            return;
+        }
+        match confirm {
+            Confirm::Quit { .. } => self.quit = true,
+            Confirm::Insert {
+                table,
+                rows,
+                collisions,
+            } => {
+                let Some(d) = self.data.as_ref().filter(|d| d.info.table == table) else {
+                    return;
+                };
+                let overwrite = (0..rows.len())
+                    .map(|i| collisions.iter().any(|&(c, _)| c == i))
+                    .collect();
+                self.pending += 1;
+                self.db.insert_rows(InsertBatch {
+                    info: d.info.clone(),
+                    columns: d.columns.clone(),
+                    rows,
+                    overwrite,
+                });
+            }
         }
     }
 
@@ -468,7 +788,7 @@ impl App {
     // Cell editor
     // ---------------------------------------------------------------------
 
-    fn open_editor(&mut self) {
+    fn open_editor(&mut self, start: EditStart) {
         let Some(d) = &self.data else { return };
         if !d.info.kind.editable() {
             let kind = d.info.kind.label();
@@ -477,23 +797,33 @@ impl App {
         let (Some(row), Some(col)) = (d.rows.get(self.cur_row), d.columns.get(self.cur_col)) else {
             return;
         };
-        let current = row.values[self.cur_col].clone();
+        if col.generated {
+            return self.set_status(StatusKind::Error, format!("{} is a generated column", col.name));
+        }
+        let current = row.cell(self.cur_col);
         let mut input = InputState::new();
         input.set_focused(true);
         let mut options: Vec<Choice> = match &col.kind {
-            ColKind::Enum(labels) => labels.iter().cloned().map(Some).collect(),
-            ColKind::Bool => vec![Some("true".into()), Some("false".into())],
+            ColKind::Enum(labels) => labels.iter().cloned().map(CellValue::Value).collect(),
+            ColKind::Bool => vec![CellValue::Value("true".into()), CellValue::Value("false".into())],
             ColKind::Other => Vec::new(),
         };
         let kind = if options.is_empty() {
-            if let Some(v) = &current {
+            if let CellValue::Value(v) = &current
+                && start != EditStart::Replace
+            {
                 input.set_value(v.clone());
-                input.end();
+                if start == EditStart::End {
+                    input.end();
+                }
             }
             EditorKind::Text
         } else {
             if col.nullable {
-                options.push(None);
+                options.push(CellValue::Null);
+            }
+            if col.has_default {
+                options.push(CellValue::Default);
             }
             let filtered: Vec<usize> = (0..options.len()).collect();
             let sel = options.iter().position(|o| *o == current).unwrap_or(0);
@@ -527,18 +857,19 @@ impl App {
             (EditorKind::Choice { filtered, sel, .. }, KeyCode::Down | KeyCode::Tab) => {
                 *sel = if *sel + 1 >= filtered.len() { 0 } else { *sel + 1 };
             }
-            (EditorKind::Choice { filtered, sel, .. }, KeyCode::Char('p')) if ctrl => {
+            (EditorKind::Choice { filtered, sel, .. }, KeyCode::Char('p' | 'k')) if ctrl => {
                 *sel = sel.saturating_sub(1).min(filtered.len().saturating_sub(1));
             }
-            (EditorKind::Choice { filtered, sel, .. }, KeyCode::Char('n')) if ctrl => {
+            (EditorKind::Choice { filtered, sel, .. }, KeyCode::Char('n' | 'j')) if ctrl => {
                 *sel = (*sel + 1).min(filtered.len().saturating_sub(1));
             }
             (EditorKind::Choice { options, filtered, sel }, KeyCode::Enter) => match filtered.get(*sel) {
                 Some(&i) => commit = Some(options[i].clone()),
                 None => return,
             },
-            (EditorKind::Text, KeyCode::Enter) => commit = Some(Some(ed.input.value().to_string())),
-            (EditorKind::Text, KeyCode::Char('n')) if ctrl => commit = Some(None),
+            (EditorKind::Text, KeyCode::Enter) => commit = Some(CellValue::Value(ed.input.value().to_string())),
+            (EditorKind::Text, KeyCode::Char('n')) if ctrl => commit = Some(CellValue::Null),
+            (EditorKind::Text, KeyCode::Char('d')) if ctrl => commit = Some(CellValue::Default),
             _ => {
                 if edit_input(&mut ed.input, key) {
                     ed.refilter();
@@ -546,15 +877,51 @@ impl App {
             }
         }
         let Some(value) = commit else { return };
-        let (row, col, current) = (ed.row, ed.col, ed.current.clone());
+        let (row, col) = (ed.row, ed.col);
         self.popup = Popup::None;
-        if value == current {
-            return;
+        self.write_cell(row, col, value);
+    }
+
+    /// Ok(false) when the write would change nothing.
+    fn check_write(&self, row: usize, col: usize, value: &CellValue) -> Result<bool, String> {
+        let Some(d) = &self.data else { return Ok(false) };
+        if !d.info.kind.editable() {
+            return Err(format!("{}s are read-only", d.info.kind.label()));
         }
-        let Some(d) = &self.data else { return };
-        let column = &d.columns[col];
-        if value.is_none() && !column.nullable {
-            return self.set_status(StatusKind::Error, format!("{} is NOT NULL", column.name));
+        let (Some(r), Some(column)) = (d.rows.get(row), d.columns.get(col)) else {
+            return Ok(false);
+        };
+        if r.cell(col) == *value {
+            return Ok(false);
+        }
+        if column.generated {
+            return Err(format!("{} is a generated column", column.name));
+        }
+        if *value == CellValue::Null && !column.nullable {
+            return Err(format!("{} is NOT NULL", column.name));
+        }
+        if *value == CellValue::Default && !column.has_default {
+            return Err(format!("{} has no default", column.name));
+        }
+        Ok(true)
+    }
+
+    /// Saves `value` into a cell, skipping no-op writes.
+    fn write_cell(&mut self, row: usize, col: usize, value: CellValue) {
+        match self.check_write(row, col, &value) {
+            Err(e) => return self.set_status(StatusKind::Error, e),
+            Ok(false) => return,
+            Ok(true) => {}
+        }
+        let Some(d) = &mut self.data else { return };
+        // Drafts are edited locally until committed.
+        if let Some(defaults) = &mut d.rows[row].draft {
+            defaults[col] = value == CellValue::Default;
+            d.rows[row].values[col] = match value {
+                CellValue::Value(v) => Some(v),
+                _ => None,
+            };
+            return;
         }
         self.pending += 1;
         self.db.update_cell(CellUpdate {
@@ -595,6 +962,95 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// Mouse
+// -------------------------------------------------------------------------
+
+impl App {
+    pub fn on_mouse(&mut self, m: MouseEvent) {
+        let pos = Position::new(m.column, m.row);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.pending_key = None;
+                self.on_click(pos);
+            }
+            MouseEventKind::ScrollDown => self.on_scroll(pos, 3),
+            MouseEventKind::ScrollUp => self.on_scroll(pos, -3),
+            _ => {}
+        }
+    }
+
+    fn on_click(&mut self, pos: Position) {
+        if !matches!(self.popup, Popup::None) {
+            let option = hit(&self.hits.options, pos);
+            let inside = self.hits.popup.is_some_and(|r| r.contains(pos));
+            match (&mut self.popup, option) {
+                (Popup::Editor(ed), Some(i)) => {
+                    if let EditorKind::Choice { sel, .. } = &mut ed.kind {
+                        *sel = i;
+                    }
+                    self.on_editor_key(KeyEvent::from(KeyCode::Enter));
+                }
+                (Popup::Favorites(_), Some(i)) => self.open_favorite(i),
+                _ if !inside => self.popup = Popup::None,
+                _ => {}
+            }
+            return;
+        }
+        if let Some(i) = hit(&self.hits.tables, pos) {
+            self.filter_active = false;
+            self.filter.set_focused(false);
+            self.table_sel = i;
+            return self.open_selected_table();
+        }
+        if let Some((row, col)) = hit(
+            &self
+                .hits
+                .cells
+                .iter()
+                .map(|&(r, row, col)| (r, (row, col)))
+                .collect::<Vec<_>>(),
+            pos,
+        ) {
+            // A click on the already-selected cell edits it.
+            let again = self.focus == Focus::Grid && (row, col) == (self.cur_row, self.cur_col);
+            self.focus = Focus::Grid;
+            self.cur_row = row;
+            self.cur_col = col;
+            if again {
+                self.open_editor(EditStart::End);
+            }
+            return;
+        }
+        if self.hits.sidebar.contains(pos) {
+            self.focus = Focus::Tables;
+        } else if self.hits.grid.contains(pos) {
+            self.focus_grid();
+        }
+    }
+
+    fn on_scroll(&mut self, pos: Position, delta: isize) {
+        let step = |v: usize, len: usize| v.saturating_add_signed(delta).min(len.saturating_sub(1));
+        match &mut self.popup {
+            Popup::Editor(Editor {
+                kind: EditorKind::Choice { filtered, sel, .. },
+                ..
+            }) => *sel = step(*sel, filtered.len()),
+            Popup::Favorites(p) => p.sel = step(p.sel, self.favorites.list().len()),
+            Popup::Editor(_) | Popup::Confirm(_) => {}
+            Popup::None if self.hits.sidebar.contains(pos) => {
+                self.table_sel = step(self.table_sel, self.visible_tables.len())
+            }
+            Popup::None if self.hits.grid.contains(pos) => {
+                if let Some(d) = &self.data {
+                    self.cur_row = step(self.cur_row, d.rows.len());
+                }
+            }
+            Popup::None => {}
         }
     }
 }

@@ -1,4 +1,5 @@
 mod app;
+mod clipboard;
 mod db;
 mod favorites;
 mod fuzzy;
@@ -10,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use ratatui::crossterm::execute;
 use ratatui_cheese::theme::Palette;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
@@ -28,6 +30,10 @@ struct Cli {
     /// Rows fetched per page
     #[arg(long, default_value_t = 200)]
     page_size: usize,
+
+    /// Leave the mouse to the terminal (native text selection) instead of qbench
+    #[arg(long)]
+    no_mouse: bool,
 
     /// Color theme
     #[arg(long, value_enum, default_value_t = Theme::Charm)]
@@ -85,7 +91,19 @@ fn main() -> Result<()> {
     let mut app = App::new(db, cli.theme.palette(), label.clone(), label, cli.page_size.max(1));
 
     let mut terminal = ratatui::init();
+    if !cli.no_mouse {
+        execute!(std::io::stdout(), EnableMouseCapture)?;
+        // ratatui's panic hook restores the screen but not mouse reporting.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+            hook(info);
+        }));
+    }
     let result = run(&mut terminal, &mut app, &rx);
+    if !cli.no_mouse {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    }
     ratatui::restore();
     result
 }
@@ -97,6 +115,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, rx: &mpsc::Receiv
         if event::poll(Duration::from_millis(60))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => app.on_key(key),
+                Event::Mouse(m) => app.on_mouse(m),
                 _ => {}
             }
         }

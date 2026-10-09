@@ -26,7 +26,24 @@ the Charm-flavoured widgets from [ratatui-cheese](https://github.com/shashanktom
   enums count too). Boolean columns offer `true` / `false`, and nullable columns also get `NULL`. Type to
   fuzzy-filter the list or use the arrow keys.
 - **Typed text for everything else.** The value is sent as text and cast server-side to the column type,
-  so Postgres reports anything invalid in the status line. <kbd>Ctrl+N</kbd> writes `NULL`.
+  so Postgres reports anything invalid in the status line. <kbd>Ctrl+N</kbd> writes `NULL` and
+  <kbd>Ctrl+D</kbd> writes `DEFAULT`. Dropdowns list `NULL` / `DEFAULT` when the column allows them.
+- **Clone rows, then insert in bulk.** <kbd>o</kbd> / <kbd>O</kbd> clones the current row below or above
+  as a local draft (`+` in the row-number column). Edit drafts like any other row and clone as many as
+  you like; nothing is written yet. Keys the database generates (serial, identity, defaulted primary
+  keys, generated columns) are left out and shown as `✱ auto`; type a value to set one yourself.
+  <kbd>Ctrl+S</kbd> checks every draft's key against the table and always asks for confirmation,
+  warning by name about any draft that would **overwrite** an existing row. All drafts are then written
+  in one transaction, so any error rolls back the whole batch and keeps the drafts. <kbd>dd</kbd>
+  discards a draft. You can't page, reload, switch tables or quit without confirming while drafts exist.
+- **Vim-style keys:** `hjkl`, `w`/`e`/`b` between columns, `gg`/`G`, `H`/`M`/`L`, `Ctrl+d/u/f/b`, and
+  `i`/`a`/`s`/`cc` to edit. <kbd>Y</kbd> / <kbd>yy</kbd> yanks a cell to the system clipboard (wl-copy,
+  xclip, xsel or pbcopy, otherwise OSC 52), and <kbd>p</kbd> pastes it into another cell.
+- **Mouse:** click a table to open it, click a cell to select it, click it again to edit, click a
+  dropdown option to apply it, and scroll with the wheel. Pass `--no-mouse` to keep the terminal's own
+  text selection.
+- **Compact table list:** while the grid has focus, the table list shrinks to a narrow strip. It expands
+  again when you focus it (<kbd>Esc</kbd>, <kbd>Tab</kbd>, <kbd>Ctrl+H</kbd> or a click).
 - **Favorites.** <kbd>f</kbd> stars a table. You can have up to 10, and each gets a number key
   (<kbd>1</kbd>–<kbd>9</kbd>, <kbd>0</kbd>). <kbd>F</kbd> opens the favorites list, and
   <kbd>Alt</kbd>+number opens one from anywhere. They are saved per connection in
@@ -67,9 +84,12 @@ cargo run -- postgres://postgres:qbench@localhost:55432/postgres
 | --- | --- |
 | Anywhere | `tab` switch pane · `?` full help · `q` / `ctrl+c` quit · `r` refresh |
 | Tables | `↑↓`/`jk` move · `enter` open · `/` fuzzy filter · `esc` clear filter |
-| Grid | `←↑↓→`/`hjkl` move · `g`/`G` first/last row · `^`/`$` first/last column · `pgup`/`pgdn` · `[`/`]` page · `enter`/`e` edit · `esc` back to tables |
-| Dropdown | type to fuzzy find · `↑↓` / `tab` select · `enter` apply · `esc` cancel |
-| Text edit | `enter` save · `ctrl+n` NULL · `ctrl+u` clear · `esc` cancel |
+| Grid motion | `←↑↓→`/`hjkl` · `w`/`e` next column · `b` previous column · `gg`/`G` first/last row · `^`/`$` first/last column · `H`/`M`/`L` top/middle/bottom of screen · `ctrl+d/u` half page · `ctrl+f/b`, `pgup`/`pgdn` full page · `[`/`]` previous/next page |
+| Grid editing | `enter`/`a` edit · `i` edit, cursor at start · `s`/`cc` replace value · `Y`/`yy` yank · `p` paste · `o`/`O` clone row · `dd` discard draft · `ctrl+s` commit drafts |
+| Panes | `esc`/`ctrl+h` table list · `ctrl+l` grid · `/` filter tables |
+| Dropdown | type to fuzzy find · `↑↓`, `tab`, `ctrl+j/k` select · `enter` or click apply · `esc` cancel |
+| Text edit | `enter` save · `ctrl+n` NULL · `ctrl+d` DEFAULT · `ctrl+u` clear · `esc` cancel |
+| Mouse | click table to open · click cell to select, click again to edit · wheel scrolls |
 | Favorites | `f` toggle · `F` list · `1`–`9`, `0` open · `alt+1`–`0` open from anywhere · `d` remove (in list) |
 
 ## How it talks to Postgres
