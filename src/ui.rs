@@ -302,11 +302,14 @@ fn is_numeric(c: &Column) -> bool {
     .any(|n| t.starts_with(n))
 }
 
-fn column_marker(c: &Column) -> &'static str {
-    match c.kind {
+/// Suffix after the type in the header: `?` for nullable columns, `▾` for dropdown columns.
+fn column_marker(c: &Column) -> String {
+    let null = if c.nullable { "?" } else { "" };
+    let drop = match c.kind {
         ColKind::Enum(_) | ColKind::Bool => " ▾",
         ColKind::Other => "",
-    }
+    };
+    format!("{null}{drop}")
 }
 
 fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
@@ -452,8 +455,14 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
         }
         spans.push(Span::styled(c.name.clone(), name_style));
         buf.set_line(x, hy, &Line::from(spans), w as u16);
-        let ty_text = truncate(&format!("{}{}", c.type_name, column_marker(c)), w);
-        buf.set_string(x, ty, ty_text, Style::new().fg(p.faint).add_modifier(Modifier::ITALIC));
+        // Truncate the type name, never the markers, so `?` stays visible on narrow columns.
+        let marker = column_marker(c);
+        let ty_name = truncate(&c.type_name, w.saturating_sub(marker.width()).max(1));
+        let ty_line = Line::from(vec![
+            Span::styled(ty_name, Style::new().fg(p.faint).add_modifier(Modifier::ITALIC)),
+            Span::styled(marker, Style::new().fg(p.muted)),
+        ]);
+        buf.set_line(x, ty, &ty_line, w as u16);
     }
     buf.set_string(inner.x, ry, "─".repeat(inner.width as usize), Style::new().fg(p.border));
     if more_left {
