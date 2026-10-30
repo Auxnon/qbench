@@ -121,11 +121,20 @@ pub enum Confirm {
     },
 }
 
+/// Fuzzy column finder (`t`). The grid cursor follows the selection; `orig_col` is restored on cancel.
+pub struct ColumnPicker {
+    pub input: InputState,
+    pub filtered: Vec<usize>,
+    pub sel: usize,
+    pub orig_col: usize,
+}
+
 pub enum Popup {
     None,
     Editor(Editor),
     Favorites(FavPicker),
     Confirm(Confirm),
+    Columns(ColumnPicker),
 }
 
 pub struct App {
@@ -486,6 +495,7 @@ impl App {
         match self.popup {
             Popup::Editor(_) => return self.on_editor_key(key),
             Popup::Favorites(_) => return self.on_favorites_key(key),
+            Popup::Columns(_) => return self.on_columns_key(key),
             Popup::Confirm(_) => return self.on_confirm_key(key),
             Popup::None => {}
         }
@@ -679,6 +689,7 @@ impl App {
             (_, KeyCode::Char('s' | 'S')) => self.open_editor(EditStart::Replace),
             (_, KeyCode::Char('Y')) => self.yank_cell(),
             (_, KeyCode::Char('p' | 'P')) => self.paste_cell(),
+            (_, KeyCode::Char('t')) => self.open_column_picker(),
             (_, KeyCode::Char('v' | 'V')) => {
                 self.visual_anchor = Some(row);
                 self.set_status(
@@ -777,6 +788,57 @@ impl App {
                 if n == 1 { "" } else { "s" }
             ),
         );
+    }
+
+    fn open_column_picker(&mut self) {
+        let Some(d) = &self.data else { return };
+        let mut input = InputState::new();
+        input.set_focused(true);
+        self.popup = Popup::Columns(ColumnPicker {
+            input,
+            filtered: (0..d.columns.len()).collect(),
+            sel: self.cur_col,
+            orig_col: self.cur_col,
+        });
+    }
+
+    /// Moves the grid cursor to the picker's current selection.
+    fn follow_column_pick(&mut self) {
+        if let Popup::Columns(cp) = &self.popup
+            && let Some(&ci) = cp.filtered.get(cp.sel)
+        {
+            self.cur_col = ci;
+        }
+    }
+
+    fn on_columns_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Popup::Columns(cp) = &mut self.popup else { return };
+        let n = cp.filtered.len();
+        match key.code {
+            KeyCode::Esc => {
+                self.cur_col = cp.orig_col;
+                self.popup = Popup::None;
+                return;
+            }
+            KeyCode::Enter => {
+                self.follow_column_pick();
+                self.popup = Popup::None;
+                return;
+            }
+            KeyCode::Up | KeyCode::BackTab => cp.sel = if cp.sel == 0 { n.saturating_sub(1) } else { cp.sel - 1 },
+            KeyCode::Down | KeyCode::Tab => cp.sel = if cp.sel + 1 >= n { 0 } else { cp.sel + 1 },
+            KeyCode::Char('p' | 'k') if ctrl => cp.sel = cp.sel.saturating_sub(1),
+            KeyCode::Char('n' | 'j') if ctrl => cp.sel = (cp.sel + 1).min(n.saturating_sub(1)),
+            _ => {
+                if edit_input(&mut cp.input, key) {
+                    let Some(d) = &self.data else { return };
+                    cp.filtered = fuzzy::filter(cp.input.value(), d.columns.iter().map(|c| c.name.as_str()));
+                    cp.sel = 0;
+                }
+            }
+        }
+        self.follow_column_pick();
     }
 
     /// Inclusive row range of the visual selection.
@@ -1154,6 +1216,11 @@ impl App {
                     self.on_editor_key(KeyEvent::from(KeyCode::Enter));
                 }
                 (Popup::Favorites(_), Some(i)) => self.open_favorite(i),
+                (Popup::Columns(cp), Some(i)) => {
+                    cp.sel = i;
+                    self.follow_column_pick();
+                    self.popup = Popup::None;
+                }
                 _ if !inside => self.popup = Popup::None,
                 _ => {}
             }
@@ -1218,6 +1285,10 @@ impl App {
                 ..
             }) => *sel = step(*sel, filtered.len()),
             Popup::Favorites(p) => p.sel = step(p.sel, self.favorites.list().len()),
+            Popup::Columns(cp) => {
+                cp.sel = step(cp.sel, cp.filtered.len());
+                self.follow_column_pick();
+            }
             Popup::Editor(_) | Popup::Confirm(_) => {}
             Popup::None if self.hits.sidebar.contains(pos) => {
                 self.table_sel = step(self.table_sel, self.visible_tables.len())

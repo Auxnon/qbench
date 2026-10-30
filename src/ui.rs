@@ -73,6 +73,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             let screen = f.area();
             draw_favorites(f.buffer_mut(), screen, app, &p);
         }
+        Popup::Columns(_) => {
+            let grid = app.hits.grid;
+            draw_columns(f, grid, app, &p);
+        }
         Popup::Confirm(_) => {
             let screen = f.area();
             draw_confirm(f.buffer_mut(), screen, app, &p);
@@ -736,6 +740,12 @@ fn help(app: &App, p: &Palette) -> Help {
             ],
         },
         (Popup::Confirm(_), _) => vec![Binding::new("y/enter", "confirm"), Binding::new("n/esc", "cancel")],
+        (Popup::Columns(_), _) => vec![
+            Binding::new("type", "fuzzy find column"),
+            Binding::new("↑/↓", "select"),
+            Binding::new("enter", "jump"),
+            Binding::new("esc", "back"),
+        ],
         (Popup::Favorites(_), _) => vec![
             Binding::new("1-0", "jump"),
             Binding::new("enter", "open"),
@@ -807,6 +817,7 @@ fn help(app: &App, p: &Palette) -> Help {
             Binding::new("tab", "switch pane"),
             Binding::new("ctrl+h/l", "tables/grid"),
             Binding::new("/", "filter tables"),
+            Binding::new("t", "find column"),
         ],
         vec![
             Binding::new("f", "toggle favorite"),
@@ -1005,6 +1016,101 @@ fn draw_editor(f: &mut Frame, app: &mut App, p: &Palette) {
             let input = Input::new("").prompt("›").placeholder(placeholder).palette(p);
             f.render_stateful_widget(&input, inner, &mut ed.input);
         }
+    }
+}
+
+/// Column finder, docked at the top-right of the grid so the jumped-to column stays visible.
+fn draw_columns(f: &mut Frame, grid: Rect, app: &mut App, p: &Palette) {
+    let Popup::Columns(cp) = &mut app.popup else { return };
+    let Some(d) = &app.data else { return };
+    let name_w = d.columns.iter().map(|c| c.name.width()).max().unwrap_or(4);
+    let type_w = d.columns.iter().map(|c| c.type_name.width()).max().unwrap_or(4).min(24);
+    let w = ((name_w + type_w + 8) as u16).clamp(34, grid.width.max(34));
+    let shown = cp.filtered.len().clamp(1, 12);
+    let h = shown as u16 + 4;
+    let rect = Rect {
+        x: grid.right().saturating_sub(w),
+        y: grid.y + 3,
+        width: w.min(grid.width),
+        height: h.min(grid.height.saturating_sub(3)),
+    };
+    app.hits.popup = Some(rect);
+    let title = Line::from(vec![
+        Span::styled(" ⇥ ", Style::new().fg(p.primary)),
+        Span::styled(
+            "Jump to column ",
+            Style::new().fg(p.secondary).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let block = popup_block(p, title, "↑↓ · enter · esc");
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    let input = Input::new("").prompt("›").placeholder("column name…").palette(p);
+    f.render_stateful_widget(&input, Rect { height: 1, ..inner }, &mut cp.input);
+
+    let buf = f.buffer_mut();
+    let count = format!("{}/{}", cp.filtered.len(), d.columns.len());
+    buf.set_string(
+        inner.right().saturating_sub(count.width() as u16),
+        inner.y,
+        &count,
+        Style::new().fg(p.faint),
+    );
+    buf.set_string(
+        inner.x,
+        inner.y + 1,
+        "─".repeat(inner.width as usize),
+        Style::new().fg(p.border),
+    );
+    let list = Rect {
+        y: inner.y + 2,
+        height: inner.height.saturating_sub(2),
+        ..inner
+    };
+    if cp.filtered.is_empty() {
+        buf.set_string(
+            list.x + 2,
+            list.y,
+            "no match",
+            Style::new().fg(p.faint).add_modifier(Modifier::ITALIC),
+        );
+        return;
+    }
+    let rows = list.height as usize;
+    let scroll = cp.sel.saturating_sub(rows.saturating_sub(1));
+    let query = cp.input.value().to_string();
+    for (row, &ci) in cp.filtered.iter().enumerate().skip(scroll).take(rows) {
+        let c = &d.columns[ci];
+        let y = list.y + (row - scroll) as u16;
+        let selected = row == cp.sel;
+        let mut base = Style::new().fg(p.foreground);
+        if selected {
+            buf.set_style(Rect { y, height: 1, ..list }, Style::new().bg(p.surface));
+            base = base.fg(p.primary).add_modifier(Modifier::BOLD);
+        }
+        let hits = fuzzy::positions(&query, &c.name);
+        let mut spans = vec![if selected {
+            Span::styled("▸ ", Style::new().fg(p.primary))
+        } else {
+            Span::raw("  ")
+        }];
+        spans.extend(c.name.chars().enumerate().map(|(i, ch)| {
+            let st = if hits.contains(&i) {
+                base.fg(p.highlight).add_modifier(Modifier::UNDERLINED)
+            } else {
+                base
+            };
+            Span::styled(ch.to_string(), st)
+        }));
+        let pad = (name_w + 2).saturating_sub(c.name.width());
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(
+            truncate(&format!("{}{}", c.type_name, column_marker(c)), type_w + 3),
+            Style::new().fg(p.faint).add_modifier(Modifier::ITALIC),
+        ));
+        buf.set_line(list.x, y, &Line::from(spans), list.width);
+        app.hits.options.push((Rect { y, height: 1, ..list }, row));
     }
 }
 

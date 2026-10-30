@@ -57,6 +57,8 @@ the Charm-flavoured widgets from [ratatui-cheese](https://github.com/shashanktom
   <kbd>Alt</kbd>+number opens one from anywhere. They are saved per connection in
   `~/.config/qbench/favorites.json`.
 - **Fuzzy table filter** (<kbd>/</kbd>) with highlighted matches, over every schema.
+- **Jump to a column** (<kbd>t</kbd>): fuzzy-find a column by name. The grid follows the best match as
+  you type, <kbd>Enter</kbd> keeps it and <kbd>Esc</kbd> goes back to where you were.
 - Rows are found by **primary key**, or by `ctid` for tables without one. Views and materialized views
   are read-only.
 - Server-side paging (<kbd>[</kbd> / <kbd>]</kbd>) and horizontal scrolling for wide tables.
@@ -95,7 +97,7 @@ cargo run -- postgres://postgres:qbench@localhost:55432/postgres
 | Grid motion | `←↑↓→`/`hjkl` · `w`/`e` next column · `b` previous column · `gg`/`G` first/last row · `0`/`^`/`_` first column · `$` last column · `H`/`M`/`L` top/middle/bottom of screen · `ctrl+d/u` half page · `ctrl+f/b`, `pgup`/`pgdn` full page · `[`/`]` previous/next page |
 | Grid editing | `enter`/`a` edit · `i` edit, cursor at start · `s`/`cc` replace value · `Y`/`yy` yank · `p` paste · `o`/`O` clone row · `dd` delete row (confirms) or discard draft · `ctrl+s` commit drafts · `ctrl+e` discard all drafts |
 | Visual | `v`/`V` start · any motion extends · `d`/`x` delete selected rows (confirms) · `y` yank rows as TSV · `esc`/`v` exit |
-| Panes | `esc`/`ctrl+h` table list · `ctrl+l` grid · `/` filter tables |
+| Panes | `esc`/`ctrl+h` table list · `ctrl+l` grid · `/` filter tables · `t` jump to a column by fuzzy name |
 | Dropdown | type to fuzzy find · `↑↓`, `tab`, `ctrl+j/k` select · `enter` or click apply · `esc` cancel |
 | Text edit | `enter` save · `ctrl+n` NULL · `ctrl+d` DEFAULT · `ctrl+u` clear · `esc` cancel |
 | Mouse | click table to open · click cell to select, click again to edit · shift+click extend selection · wheel scrolls rows · side-scroll / shift+wheel scrolls columns |
