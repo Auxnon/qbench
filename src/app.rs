@@ -516,6 +516,8 @@ impl App {
             KeyCode::Char('f') => self.toggle_favorite(),
             KeyCode::Char('F') => self.popup = Popup::Favorites(FavPicker { sel: 0 }),
             KeyCode::Char('r') => self.reload(),
+            // In the grid, 0 is vim's first-column motion; favorite #10 stays on alt+0.
+            KeyCode::Char('0') if self.focus == Focus::Grid => self.on_grid_key(key, None),
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 if let Some(i) = favorites::index_for_digit(c) {
                     self.open_favorite(i);
@@ -660,7 +662,7 @@ impl App {
             (_, KeyCode::Char('H')) => self.cur_row = self.row_scroll.min(last_row),
             (_, KeyCode::Char('M')) => self.cur_row = (self.row_scroll + bottom) / 2,
             (_, KeyCode::Char('L')) => self.cur_row = bottom,
-            (_, KeyCode::Home | KeyCode::Char('^')) => self.cur_col = 0,
+            (_, KeyCode::Home | KeyCode::Char('^' | '_' | '0')) => self.cur_col = 0,
             (_, KeyCode::End | KeyCode::Char('$')) => self.cur_col = last_col,
             (_, KeyCode::Char(']')) if page < last_page => {
                 let info = d.info.clone();

@@ -52,7 +52,8 @@ the Charm-flavoured widgets from [ratatui-cheese](https://github.com/shashanktom
 - **Compact table list:** while the grid has focus, the table list shrinks to a narrow strip. It expands
   again when you focus it (<kbd>Esc</kbd>, <kbd>Tab</kbd>, <kbd>Ctrl+H</kbd> or a click).
 - **Favorites.** <kbd>f</kbd> stars a table. You can have up to 10, and each gets a number key
-  (<kbd>1</kbd>–<kbd>9</kbd>, <kbd>0</kbd>). <kbd>F</kbd> opens the favorites list, and
+  (<kbd>1</kbd>–<kbd>9</kbd>, <kbd>0</kbd>). In the grid, <kbd>0</kbd> moves to the first column as in
+  vim, so the tenth favorite is on <kbd>Alt+0</kbd> there. <kbd>F</kbd> opens the favorites list, and
   <kbd>Alt</kbd>+number opens one from anywhere. They are saved per connection in
   `~/.config/qbench/favorites.json`.
 - **Fuzzy table filter** (<kbd>/</kbd>) with highlighted matches, over every schema.
@@ -91,14 +92,14 @@ cargo run -- postgres://postgres:qbench@localhost:55432/postgres
 | --- | --- |
 | Anywhere | `tab` switch pane · `?` full help · `q` / `ctrl+c` quit · `r` refresh |
 | Tables | `↑↓`/`jk` move · `enter` open · `/` fuzzy filter · `esc` clear filter |
-| Grid motion | `←↑↓→`/`hjkl` · `w`/`e` next column · `b` previous column · `gg`/`G` first/last row · `^`/`$` first/last column · `H`/`M`/`L` top/middle/bottom of screen · `ctrl+d/u` half page · `ctrl+f/b`, `pgup`/`pgdn` full page · `[`/`]` previous/next page |
+| Grid motion | `←↑↓→`/`hjkl` · `w`/`e` next column · `b` previous column · `gg`/`G` first/last row · `0`/`^`/`_` first column · `$` last column · `H`/`M`/`L` top/middle/bottom of screen · `ctrl+d/u` half page · `ctrl+f/b`, `pgup`/`pgdn` full page · `[`/`]` previous/next page |
 | Grid editing | `enter`/`a` edit · `i` edit, cursor at start · `s`/`cc` replace value · `Y`/`yy` yank · `p` paste · `o`/`O` clone row · `dd` delete row (confirms) or discard draft · `ctrl+s` commit drafts · `ctrl+e` discard all drafts |
 | Visual | `v`/`V` start · any motion extends · `d`/`x` delete selected rows (confirms) · `y` yank rows as TSV · `esc`/`v` exit |
 | Panes | `esc`/`ctrl+h` table list · `ctrl+l` grid · `/` filter tables |
 | Dropdown | type to fuzzy find · `↑↓`, `tab`, `ctrl+j/k` select · `enter` or click apply · `esc` cancel |
 | Text edit | `enter` save · `ctrl+n` NULL · `ctrl+d` DEFAULT · `ctrl+u` clear · `esc` cancel |
 | Mouse | click table to open · click cell to select, click again to edit · shift+click extend selection · wheel scrolls rows · side-scroll / shift+wheel scrolls columns |
-| Favorites | `f` toggle · `F` list · `1`–`9`, `0` open · `alt+1`–`0` open from anywhere · `d` remove (in list) |
+| Favorites | `f` toggle · `F` list · `1`–`9`, `0` open (`0` is first column in the grid) · `alt+1`–`0` open from anywhere · `d` remove (in list) |
 
 ## How it talks to Postgres
 

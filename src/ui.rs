@@ -782,7 +782,7 @@ fn help(app: &App, p: &Palette) -> Help {
             Binding::new("←↑↓→/hjkl", "move"),
             Binding::new("w/e  b", "next/prev col"),
             Binding::new("gg/G", "first/last row"),
-            Binding::new("^/$", "first/last col"),
+            Binding::new("0/^/_  $", "first/last col"),
             Binding::new("H/M/L", "screen top/mid/bot"),
             Binding::new("ctrl+d/u", "half page"),
             Binding::new("ctrl+f/b", "full page"),
@@ -811,7 +811,7 @@ fn help(app: &App, p: &Palette) -> Help {
         vec![
             Binding::new("f", "toggle favorite"),
             Binding::new("F", "favorites list"),
-            Binding::new("1-9, 0", "open favorite"),
+            Binding::new("1-9, 0", "open favorite (0: not in grid)"),
             Binding::new("alt+1-0", "open (anywhere)"),
         ],
         vec![
