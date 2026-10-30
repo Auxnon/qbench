@@ -306,6 +306,41 @@ fn is_numeric(c: &Column) -> bool {
     .any(|n| t.starts_with(n))
 }
 
+/// Postgres's short alias for a `format_type()` name, for display only (SQL casts keep the full name):
+/// `timestamp(3) with time zone` → `timestamptz(3)`, `character varying(64)[]` → `varchar(64)[]`.
+fn short_type(full: &str) -> String {
+    let base = full.trim_end_matches("[]");
+    let arrays = &full[base.len()..];
+    // Split off a precision/length modifier such as "(3)" so suffixes can be matched around it.
+    let (name, rest) = match base.find('(') {
+        Some(i) => base.split_at(i),
+        None => (base, ""),
+    };
+    let (modifier, tail) = match rest.find(')') {
+        Some(i) => rest.split_at(i + 1),
+        None => (rest, ""),
+    };
+    let short = match (name, tail) {
+        ("timestamp", " with time zone") => "timestamptz",
+        ("timestamp", " without time zone") => "timestamp",
+        ("timestamp with time zone", _) => "timestamptz",
+        ("timestamp without time zone", _) => "timestamp",
+        ("time", " with time zone") => "timetz",
+        ("time", " without time zone") => "time",
+        ("time with time zone", _) => "timetz",
+        ("time without time zone", _) => "time",
+        ("character varying", _) => "varchar",
+        ("character", _) => "char",
+        ("bit varying", _) => "varbit",
+        ("integer", _) => "int",
+        ("boolean", _) => "bool",
+        ("double precision", _) => "float8",
+        ("real", _) => "float4",
+        _ => return full.to_string(),
+    };
+    format!("{short}{modifier}{arrays}")
+}
+
 /// Suffix after the type in the header: `?` for nullable columns, `▾` for dropdown columns.
 fn column_marker(c: &Column) -> String {
     let null = if c.nullable { "?" } else { "" };
@@ -382,7 +417,7 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
         .enumerate()
         .map(|(ci, c)| {
             let head = c.name.width() + if c.is_pk { 2 } else { 0 };
-            let ty = (c.type_name.width() + column_marker(c).width()).min(18);
+            let ty = (short_type(&c.type_name).width() + column_marker(c).width()).min(18);
             let vals = d
                 .rows
                 .iter()
@@ -461,7 +496,7 @@ fn draw_grid(buf: &mut Buffer, area: Rect, app: &mut App, p: &Palette) {
         buf.set_line(x, hy, &Line::from(spans), w as u16);
         // Truncate the type name, never the markers, so `?` stays visible on narrow columns.
         let marker = column_marker(c);
-        let ty_name = truncate(&c.type_name, w.saturating_sub(marker.width()).max(1));
+        let ty_name = truncate(&short_type(&c.type_name), w.saturating_sub(marker.width()).max(1));
         let ty_line = Line::from(vec![
             Span::styled(ty_name, Style::new().fg(p.faint).add_modifier(Modifier::ITALIC)),
             Span::styled(marker, Style::new().fg(p.muted)),
@@ -615,7 +650,7 @@ fn draw_status(buf: &mut Buffer, area: Rect, app: &App, p: &Palette) {
     {
         let mut spans = vec![
             Span::styled(c.name.clone(), Style::new().fg(p.secondary)),
-            Span::styled(format!(" {}", c.type_name), Style::new().fg(p.faint)),
+            Span::styled(format!(" {}", short_type(&c.type_name)), Style::new().fg(p.faint)),
         ];
         if !c.nullable {
             spans.push(Span::styled(" not null", Style::new().fg(p.faint)));
@@ -890,7 +925,7 @@ fn draw_editor(f: &mut Frame, app: &mut App, p: &Palette) {
             col.name.clone(),
             Style::new().fg(p.secondary).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" {} ", col.type_name), Style::new().fg(p.faint)),
+        Span::styled(format!(" {} ", short_type(&col.type_name)), Style::new().fg(p.faint)),
     ]);
     let anchor_w = anchor.map_or(0, |a| a.width);
 
@@ -1024,7 +1059,13 @@ fn draw_columns(f: &mut Frame, grid: Rect, app: &mut App, p: &Palette) {
     let Popup::Columns(cp) = &mut app.popup else { return };
     let Some(d) = &app.data else { return };
     let name_w = d.columns.iter().map(|c| c.name.width()).max().unwrap_or(4);
-    let type_w = d.columns.iter().map(|c| c.type_name.width()).max().unwrap_or(4).min(24);
+    let type_w = d
+        .columns
+        .iter()
+        .map(|c| short_type(&c.type_name).width())
+        .max()
+        .unwrap_or(4)
+        .min(24);
     let w = ((name_w + type_w + 8) as u16).clamp(34, grid.width.max(34));
     let shown = cp.filtered.len().clamp(1, 12);
     let h = shown as u16 + 4;
@@ -1106,7 +1147,7 @@ fn draw_columns(f: &mut Frame, grid: Rect, app: &mut App, p: &Palette) {
         let pad = (name_w + 2).saturating_sub(c.name.width());
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(
-            truncate(&format!("{}{}", c.type_name, column_marker(c)), type_w + 3),
+            truncate(&format!("{}{}", short_type(&c.type_name), column_marker(c)), type_w + 3),
             Style::new().fg(p.faint).add_modifier(Modifier::ITALIC),
         ));
         buf.set_line(list.x, y, &Line::from(spans), list.width);
@@ -1296,4 +1337,35 @@ fn draw_confirm(buf: &mut Buffer, screen: Rect, app: &mut App, p: &Palette) {
     Clear.render(rect, buf);
     block.render(rect, buf);
     Paragraph::new(lines).render(inner, buf);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::short_type;
+
+    #[test]
+    fn short_type_aliases() {
+        for (full, short) in [
+            ("timestamp with time zone", "timestamptz"),
+            ("timestamp(3) with time zone", "timestamptz(3)"),
+            ("timestamp without time zone", "timestamp"),
+            ("timestamp(6) without time zone[]", "timestamp(6)[]"),
+            ("time with time zone", "timetz"),
+            ("character varying(64)", "varchar(64)"),
+            ("character varying", "varchar"),
+            ("character varying(10)[]", "varchar(10)[]"),
+            ("character(1)", "char(1)"),
+            ("integer", "int"),
+            ("integer[]", "int[]"),
+            ("boolean", "bool"),
+            ("double precision", "float8"),
+            ("bit varying(8)", "varbit(8)"),
+            ("numeric(10,2)", "numeric(10,2)"),
+            ("bigint", "bigint"),
+            ("shop.order_status", "shop.order_status"),
+            ("\"char\"", "\"char\""),
+        ] {
+            assert_eq!(short_type(full), short, "{full}");
+        }
+    }
 }
